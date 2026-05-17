@@ -3902,3 +3902,126 @@ what exact follow-up is needed
 
 Do not accept vague completion reports such as "implemented fallback" or
 "should work". Require test names, observed results, and any remaining gaps.
+
+## 40. Current relay framework handoff
+
+As of the current scaffold, `modelwire-server/src/relay.rs` is the main
+data-plane seam for `/v1/responses`. Keep the route handler thin and add
+behavior inside this pipeline:
+
+```text
+create_response
+  -> relay_non_streaming_response
+  -> snapshot_route
+  -> parse_canonical_request
+  -> try_target
+  -> adapter.build_request
+  -> upstream HTTP call
+  -> adapter.parse_response
+  -> normalize_downstream_response
+  -> persist_response_shell
+```
+
+Framework behavior currently in place:
+
+1. Request parsing supports non-streaming Responses text/message input,
+   `instructions`, basic function tool definitions, generation parameters, and
+   explicit target protocols.
+2. Route and target config are snapshotted at request start.
+3. The first explicit target protocol can be native Responses, OpenAI Chat, or
+   Anthropic. `wire_api = "auto"` returns an explicit protocol error until the
+   lazy probe framework is filled.
+4. Upstream responses are normalized to ModelWire-owned downstream response,
+   message, and tool-call IDs. Upstream IDs remain private.
+5. `previous_response_id` returns an explicit scaffold error until state
+   ownership and replay are implemented.
+6. The database write is intentionally a shell write through
+   `modelwire_db::repo::responses::store_response`; later work must replace or
+   extend it with route, target, upstream handle, usage, and transcript item
+   persistence.
+
+Next small-model implementation tasks should target these exact seams:
+
+```text
+Task:
+  Add lazy probe resolution for explicit RouteSnapshot/TargetSnapshot.
+
+Files to edit:
+  - modelwire-server/src/relay.rs
+  - modelwire-db/src/repo/probes.rs
+
+Do not edit:
+  - modelwire-server/src/routes/responses.rs
+
+Behavior:
+  1. Replace the `WireApi::Auto` error in `try_target` with probe lookup.
+  2. Probe key must be provider ID + credential hash + upstream model.
+  3. Probe order must be responses, anthropic, openai_chat.
+
+Tests:
+  1. Probe cache hit does not call upstream.
+  2. 404 for responses advances to anthropic/chat.
+  3. 401 stops probing.
+
+Acceptance:
+  The task is complete only when these commands pass:
+  - cargo fmt --check
+  - cargo test --workspace
+```
+
+```text
+Task:
+  Persist complete response metadata and upstream handles.
+
+Files to edit:
+  - modelwire-server/src/relay.rs
+  - modelwire-db/src/repo/responses.rs
+
+Do not edit:
+  - modelwire-adapters/src/*.rs
+
+Behavior:
+  1. Store route_id, target_id, provider_id, upstream_model, wire_api,
+     upstream_response_id, state_scope, previous_response_id, status, and usage.
+  2. Store visible output items in response_items in order.
+  3. Store upstream response IDs only in operational state, never downstream JSON.
+
+Tests:
+  1. Native Responses upstream ID is absent downstream but present in SQL.
+  2. Response items are persisted in output order.
+
+Acceptance:
+  The task is complete only when these commands pass:
+  - cargo fmt --check
+  - cargo test --workspace
+```
+
+```text
+Task:
+  Add streaming framework using the same route snapshot and target attempt
+  types.
+
+Files to edit:
+  - modelwire-server/src/relay.rs
+  - modelwire-server/src/routes/responses.rs
+  - modelwire-adapters/src/sse.rs
+
+Do not edit:
+  - modelwire-core/src/config.rs
+
+Behavior:
+  1. `stream = true` must call a new streaming relay path.
+  2. Buffer upstream SSE until the first semantic event before downstream
+     commit.
+  3. Do not fallback after the first downstream SSE event.
+
+Tests:
+  1. Upstream failure before commit falls back.
+  2. Upstream failure after commit emits failure and does not fallback.
+  3. UTF-8 split across chunks is parsed correctly.
+
+Acceptance:
+  The task is complete only when these commands pass:
+  - cargo fmt --check
+  - cargo test --workspace
+```
