@@ -1017,37 +1017,55 @@ mod admin_security {
 
     #[test]
     fn config_export_redacts_secrets() {
-        // Admin config export should redact all secrets by default.
-        // Create test config with secrets
-        let config_with_secrets = json!({
-            "providers": [{
-                "id": "secret-provider",
-                "name": "Secret Provider",
-                "base_url": "https://api.example.com",
-                "api_key": "sk-real-secret-key"
-            }],
-            "routes": [{
-                "id": "route-1",
-                "downstream_model": "model-1"
-            }]
+        let rt = tokio::runtime::Runtime::new().expect("runtime should initialize");
+        rt.block_on(async {
+            let mut state = build_admin_secured_state().await;
+            state.config.server.public_base_url =
+                Some("https://modelwire.example.com".to_string());
+            state.config.providers = vec![ProviderConfig {
+                id: "secret-provider".to_string(),
+                name: "Secret Provider".to_string(),
+                base_url: "https://api.example.com".to_string(),
+                auth_mode: "managed".to_string(),
+                default_wire_api: "responses".to_string(),
+                state_scope: None,
+                api_key: Some("sk-real-secret-key".to_string()),
+                allow_private_ips: false,
+                skip_ssrf_validation: true,
+                config_json: None,
+            }];
+            let app = build_router(Arc::new(state));
+
+            let request = Request::builder()
+                .method("GET")
+                .uri("/admin/api/config/export")
+                .header("origin", "https://modelwire.example.com")
+                .header("authorization", "Bearer admin-test-password")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let serialized = payload.to_string();
+
+            assert!(
+                !serialized.contains("sk-real-secret-key"),
+                "exported config must not include raw provider api_key"
+            );
+            assert!(
+                payload
+                    .get("providers")
+                    .and_then(|p| p.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|first| first.get("api_key"))
+                    .is_none(),
+                "exported provider entries must omit api_key field"
+            );
         });
-
-        // Export config (simulating admin::export_config)
-        let redacted_export = json!({
-            "providers": [{
-                "id": "secret-provider",
-                "name": "Secret Provider",
-                "base_url": "https://api.example.com"
-                // api_key omitted - this is the redaction
-            }],
-            "routes": config_with_secrets["routes"]
-        });
-
-        let export_str = serde_json::to_string(&redacted_export).unwrap();
-
-        // Verify no secrets in export
-        assert!(!export_str.contains("sk-real-secret-key"));
-        assert!(!export_str.contains("api_key"));
     }
 
     #[tokio::test]

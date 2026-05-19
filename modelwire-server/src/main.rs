@@ -150,6 +150,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
+    use std::path::PathBuf;
+
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate should live inside workspace")
+            .to_path_buf()
+    }
 
     #[test]
     fn cli_accepts_config_before_serve_subcommand() {
@@ -165,5 +174,28 @@ mod tests {
             .expect("CLI should parse serve with default config");
         assert_eq!(args.config, "modelwire.toml");
         assert!(matches!(args.command, Some(Commands::Serve)));
+    }
+
+    #[test]
+    fn cli_help_flag_parses_as_help_display() {
+        let err = Args::try_parse_from(["modelwire", "--help"])
+            .expect_err("help flag should short-circuit parse as display help");
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn config_loading_invalid_path_fails_with_clear_error_prefix() {
+        let missing_path = workspace_root()
+            .join("modelwire-server")
+            .join("tests")
+            .join("fixtures")
+            .join("missing-does-not-exist.toml");
+        let err = core::Config::from_file(&missing_path)
+            .expect_err("missing config path should fail fast");
+        let wrapped = format!("Failed to load config: {}", err);
+        assert!(
+            wrapped.starts_with("Failed to load config:"),
+            "error message should keep clear config-loading prefix"
+        );
     }
 }

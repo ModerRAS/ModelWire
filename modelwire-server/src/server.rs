@@ -572,4 +572,27 @@ mod tests {
         let payload: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload.error.code.as_deref(), Some("method_not_allowed"));
     }
+
+    #[tokio::test]
+    async fn request_id_header_is_reflected_in_response() {
+        let state = build_min_state().await;
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .header("x-request-id", "req_mw_acceptance_001")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("req_mw_acceptance_001")
+        );
+    }
 }
