@@ -1268,40 +1268,143 @@ mod state_scope_reuse_tests {
     /// Verifies state scope reuse requires same provider scope
     #[tokio::test]
     async fn different_state_scope_prevents_reuse() {
-        let upstream = MockServer::start().await;
-        let second_request_includes_history = Arc::new(std::sync::Mutex::new(false));
-        let second_request_includes_history_clone = Arc::clone(&second_request_includes_history);
+        let upstream_a = MockServer::start().await;
+        let upstream_b = MockServer::start().await;
+
+        let second_request_capture = Arc::new(std::sync::Mutex::new(None));
+        let second_request_capture_clone = Arc::clone(&second_request_capture);
+
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(move |_req: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "resp_upstream_scope_a_1",
+                    "model": "gpt-a",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_scope_a_1",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "First response from scope A"}]
+                    }],
+                    "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+                }))
+            })
+            .expect(1)
+            .mount(&upstream_a)
+            .await;
 
         Mock::given(method("POST"))
             .and(path("/responses"))
             .respond_with(move |req: &wiremock::Request| {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
-
-                // Check if this is the second request with input items (replay)
-                if let Some(input) = body.get("input").and_then(|v| v.as_array()) {
-                    if input.len() > 1 {
-                        *second_request_includes_history_clone.lock().unwrap() = true;
-                    }
-                }
+                *second_request_capture_clone.lock().unwrap() = Some(body);
 
                 ResponseTemplate::new(200).set_body_json(json!({
-                    "id": format!("resp_{}", uuid::Uuid::now_v7()),
-                    "model": "gpt-4",
+                    "id": "resp_upstream_scope_b_1",
+                    "model": "gpt-b",
                     "output": [{
                         "type": "message",
-                        "id": format!("msg_{}", uuid::Uuid::now_v7()),
+                        "id": "msg_scope_b_1",
                         "role": "assistant",
-                        "content": [{"type": "output_text", "text": "Response"}]
+                        "content": [{"type": "output_text", "text": "Second response from scope B"}]
                     }],
-                    "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+                    "usage": {"input_tokens": 20, "output_tokens": 7, "total_tokens": 27}
                 }))
             })
-            .expect(2)
-            .mount(&upstream)
+            .expect(1)
+            .mount(&upstream_b)
             .await;
 
-        // Build state with different scopes (should cause replay)
-        let state = Arc::new(build_different_scope_test_state(&upstream.uri()).await);
+        // Build state with different providers/state scopes and two downstream models.
+        let config = Config {
+            server: ServerConfig {
+                upstream_timeout_secs: 5,
+                ..ServerConfig::default()
+            },
+            security: SecurityConfig::default(),
+            archive: ArchiveConfig::default(),
+            providers: vec![
+                ProviderConfig {
+                    id: "provider-a".to_string(),
+                    name: "Provider A".to_string(),
+                    base_url: upstream_a.uri(),
+                    auth_mode: "managed".to_string(),
+                    default_wire_api: "responses".to_string(),
+                    state_scope: Some("scope-a".to_string()),
+                    api_key: Some("k1".to_string()),
+                    allow_private_ips: false,
+                    skip_ssrf_validation: true,
+                    config_json: None,
+                },
+                ProviderConfig {
+                    id: "provider-b".to_string(),
+                    name: "Provider B".to_string(),
+                    base_url: upstream_b.uri(),
+                    auth_mode: "managed".to_string(),
+                    default_wire_api: "responses".to_string(),
+                    state_scope: Some("scope-b".to_string()),
+                    api_key: Some("k1".to_string()),
+                    allow_private_ips: false,
+                    skip_ssrf_validation: true,
+                    config_json: None,
+                },
+            ],
+            routes: vec![
+                RouteConfig {
+                    id: Some("route-a".to_string()),
+                    downstream_model: "model-a".to_string(),
+                    description: None,
+                    enabled: true,
+                    targets: vec![TargetConfig {
+                        provider: "provider-a".to_string(),
+                        upstream_model: "gpt-a".to_string(),
+                        wire_api: "responses".to_string(),
+                        priority: 10,
+                        enabled: true,
+                        context_window_tokens: Some(200_000),
+                        max_output_tokens: None,
+                        auto_compact_recommended_tokens: None,
+                        context_safety_margin_tokens: Some(2_000),
+                        token_estimator: None,
+                        context_overflow_policy: "reject".to_string(),
+                        config_json: None,
+                    }],
+                },
+                RouteConfig {
+                    id: Some("route-b".to_string()),
+                    downstream_model: "model-b".to_string(),
+                    description: None,
+                    enabled: true,
+                    targets: vec![TargetConfig {
+                        provider: "provider-b".to_string(),
+                        upstream_model: "gpt-b".to_string(),
+                        wire_api: "responses".to_string(),
+                        priority: 10,
+                        enabled: true,
+                        context_window_tokens: Some(200_000),
+                        max_output_tokens: None,
+                        auto_compact_recommended_tokens: None,
+                        context_safety_margin_tokens: Some(2_000),
+                        token_estimator: None,
+                        context_overflow_policy: "reject".to_string(),
+                        config_json: None,
+                    }],
+                },
+            ],
+        };
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+
+        let state = Arc::new(ServerState {
+            config,
+            db,
+            probe_cache: dashmap::DashMap::new(),
+            probe_locks: dashmap::DashMap::new(),
+            key_limiter_counters: dashmap::DashMap::new(),
+            ip_limiter_counters: dashmap::DashMap::new(),
+            archive_writer: tokio::sync::Mutex::new(None),
+        });
         let app = build_router(Arc::clone(&state));
 
         // First request
@@ -1310,7 +1413,7 @@ mod state_scope_reuse_tests {
             .uri("/v1/responses")
             .header("authorization", "Bearer mw_test_key")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"model": "codex-main", "input": "First"}"#))
+            .body(Body::from(r#"{"model": "model-a", "input": "First"}"#))
             .unwrap();
 
         let first_response = app.clone().oneshot(first_request).await.unwrap();
@@ -1330,7 +1433,7 @@ mod state_scope_reuse_tests {
             .header("content-type", "application/json")
             .body(Body::from(
                 json!({
-                    "model": "codex-main",
+                    "model": "model-b",
                     "input": "Second",
                     "previous_response_id": first_response_id
                 })
@@ -1341,11 +1444,27 @@ mod state_scope_reuse_tests {
         let second_response = app.oneshot(second_request).await.unwrap();
         assert_eq!(second_response.status(), axum::http::StatusCode::OK);
 
-        // With different scopes, history should be replayed
-        let _had_replay = *second_request_includes_history.lock().unwrap();
-        // The behavior depends on implementation, but with different scopes
-        // we expect either replay or a fresh request
-        // Test passes - behavior varies based on implementation
+        let captured = second_request_capture
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("Second upstream request should be captured");
+
+        // Different provider/state_scope must never receive raw previous upstream handle.
+        assert!(
+            captured.get("previous_response_id").is_none(),
+            "Cross-provider/different-scope continuation must not forward previous_response_id"
+        );
+
+        // Continuation should replay history into input for the new upstream.
+        let input = captured
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("Replayed request must include input array");
+        assert!(
+            input.len() >= 2,
+            "Replayed request should contain prior visible history + new turn"
+        );
     }
 }
 
@@ -2267,63 +2386,6 @@ async fn build_state_scope_test_state(upstream_base_url: &str) -> ServerState {
     }
 }
 
-/// Build a test ServerState with different providers for different scopes.
-async fn build_different_scope_test_state(upstream_base_url: &str) -> ServerState {
-    let config = Config {
-        server: ServerConfig {
-            upstream_timeout_secs: 5,
-            ..ServerConfig::default()
-        },
-        security: SecurityConfig::default(),
-        archive: ArchiveConfig::default(),
-        providers: vec![ProviderConfig {
-            id: "provider-a".to_string(),
-            name: "Provider A".to_string(),
-            base_url: upstream_base_url.to_string(),
-            auth_mode: "managed".to_string(),
-            default_wire_api: "responses".to_string(),
-            state_scope: Some("scope-a".to_string()),
-            api_key: Some("k1".to_string()),
-            allow_private_ips: false,
-            skip_ssrf_validation: true, // Allow localhost URLs in tests
-            config_json: None,
-        }],
-        routes: vec![RouteConfig {
-            id: Some("test-route".to_string()),
-            downstream_model: "codex-main".to_string(),
-            description: None,
-            enabled: true,
-            targets: vec![TargetConfig {
-                provider: "provider-a".to_string(),
-                upstream_model: "gpt-4".to_string(),
-                wire_api: "responses".to_string(),
-                priority: 10,
-                enabled: true,
-                context_window_tokens: Some(200_000),
-                max_output_tokens: None,
-                auto_compact_recommended_tokens: None,
-                context_safety_margin_tokens: Some(2_000),
-                token_estimator: None,
-                context_overflow_policy: "reject".to_string(),
-                config_json: None,
-            }],
-        }],
-    };
-
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    db.run_migrations().await.unwrap();
-
-    ServerState {
-        config,
-        db,
-        probe_cache: dashmap::DashMap::new(),
-        probe_locks: dashmap::DashMap::new(),
-        key_limiter_counters: dashmap::DashMap::new(),
-        ip_limiter_counters: dashmap::DashMap::new(),
-        archive_writer: tokio::sync::Mutex::new(None),
-    }
-}
-
 /// Build a test ServerState connecting to a specific database URL.
 /// Used for restart/continuation tests that need on-disk persistence.
 async fn build_state_with_db(db_path: &std::path::Path, upstream_url: &str) -> ServerState {
@@ -2743,23 +2805,26 @@ mod state_scope_reuse_failure_tests {
     async fn state_scope_optimistic_reuse_failure_then_replay() {
         let upstream = MockServer::start().await;
 
-        // Track if upstream received replayed history
-        let received_history_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let received_history_count_clone = Arc::clone(&received_history_count);
+        // Track request sequence to verify:
+        // 1) first turn no previous_response_id
+        // 2) optimistic reuse sends previous_response_id and fails 404
+        // 3) retry replays history without previous_response_id
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let requests_clone = Arc::clone(&requests);
+        let call_index = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let call_index_clone = Arc::clone(&call_index);
 
         Mock::given(method("POST"))
             .and(path("/responses"))
             .respond_with(move |req: &wiremock::Request| {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                requests_clone.lock().unwrap().push(body.clone());
+                let idx = call_index_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-                // Check if request has input items (indicating replay)
-                let input_items = body.get("input").and_then(|v| v.as_array());
-                if let Some(items) = input_items {
-                    if items.len() > 1 {
-                        // This is a replay - has conversation history
-                        received_history_count_clone
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    }
+                if idx == 1 {
+                    // Second overall call: optimistic handle reuse attempt.
+                    // Force "not found" so relay retries with materialized replay.
+                    return ResponseTemplate::new(404).set_body_string("response not found");
                 }
 
                 ResponseTemplate::new(200).set_body_json(json!({
@@ -2774,7 +2839,7 @@ mod state_scope_reuse_failure_tests {
                     "usage": {"input_tokens": 20, "output_tokens": 6, "total_tokens": 26}
                 }))
             })
-            .expect(2)
+            .expect(3)
             .mount(&upstream)
             .await;
 
@@ -2821,12 +2886,30 @@ mod state_scope_reuse_failure_tests {
         let second_response = app.oneshot(second_request).await.unwrap();
         assert_eq!(second_response.status(), axum::http::StatusCode::OK);
 
-        // Verify the system processed the request
-        // (Either via reuse or replay - both paths should succeed)
-        let history_count = received_history_count.load(std::sync::atomic::Ordering::SeqCst);
+        let captured = requests.lock().unwrap().clone();
         assert!(
-            history_count >= 1 || history_count == 0,
-            "System should handle continuation via either reuse or replay"
+            captured.len() == 3,
+            "Expected first turn + optimistic reuse attempt + replay retry"
+        );
+
+        let optimistic_attempt = &captured[1];
+        assert!(
+            optimistic_attempt.get("previous_response_id").is_some(),
+            "Optimistic reuse attempt should send previous_response_id upstream"
+        );
+
+        let replay_attempt = &captured[2];
+        assert!(
+            replay_attempt.get("previous_response_id").is_none(),
+            "Replay retry must not send previous_response_id upstream"
+        );
+        let replay_input = replay_attempt
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("Replay retry should include input array");
+        assert!(
+            replay_input.len() >= 2,
+            "Replay retry should include replayed history plus new user input"
         );
     }
 

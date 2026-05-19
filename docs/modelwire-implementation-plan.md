@@ -4470,6 +4470,18 @@ Framework behavior currently in place:
     `postgres_tls_required_when_configured`, and
     `sql_queries_use_parameters_for_user_input`.
 
+85. Hardened Milestone 7 state-scope continuation acceptance slices with
+    deterministic request-shape assertions:
+    `different_state_scope_prevents_reuse` now uses two providers with different
+    `state_scope` values and verifies the second upstream request never forwards
+    raw `previous_response_id` while replaying prior visible history in `input`;
+    `state_scope_optimistic_reuse_failure_then_replay` now forces a real
+    optimistic reuse failure (`404 response not found`) and verifies the
+    follow-up replay retry removes upstream `previous_response_id` and includes
+    replayed history plus the new turn. This closes weak/tautological assertions
+    in these slices and strengthens milestone/public-alpha evidence for
+    cross-scope replay and pre-commit reuse-failure fallback behavior.
+
 Next small-model implementation tasks should target these exact seams:
 
 ```text
