@@ -4457,6 +4457,18 @@ Framework behavior currently in place:
     `janitor_sqlite_parameterized_ids_handle_quotes_safely` verifies expired
     IDs containing quote characters are deleted safely while unrelated rows
     remain intact.
+84. Closed remaining section 28.1.8 runtime hardening gaps for DB/archive
+    protection:
+    SQLite operational DB connections now enforce owner-only file permissions
+    (`0600`) and owner-only parent directory permissions (`0700`) on Unix;
+    archive writer now enforces owner-only root/archive directory permissions
+    (`0700`) on Unix; and Postgres remote connection URLs now fail fast unless
+    TLS is explicitly required (`sslmode=require|verify-ca|verify-full`). Added
+    runtime security coverage
+    `sqlite_file_permissions_owner_only_when_supported`,
+    `archive_directory_permissions_owner_only_when_supported`,
+    `postgres_tls_required_when_configured`, and
+    `sql_queries_use_parameters_for_user_input`.
 
 Next small-model implementation tasks should target these exact seams:
 

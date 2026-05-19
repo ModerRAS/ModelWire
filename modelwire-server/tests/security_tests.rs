@@ -3695,6 +3695,219 @@ mod deployment_hardening {
 }
 
 // ============================================================================
+// Section 28.1.8: Database and Archive Protection Tests
+// ============================================================================
+
+mod database_and_archive_protection {
+    use super::*;
+
+    #[tokio::test]
+    async fn sqlite_file_permissions_owner_only_when_supported() {
+        #[cfg(not(unix))]
+        {
+            return;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let temp = tempfile::tempdir().unwrap();
+            let db_path = temp.path().join("ops.db");
+            let db_url = format!("sqlite://{}", db_path.to_string_lossy().replace('\\', "/"));
+
+            let db = Database::connect(&db_url).await.unwrap();
+            db.run_migrations().await.unwrap();
+
+            let metadata = std::fs::metadata(&db_path).expect("sqlite db file should exist");
+            let mode = metadata.permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "sqlite operational DB file should be owner-only (0600) on unix"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_directory_permissions_owner_only_when_supported() {
+        #[cfg(not(unix))]
+        {
+            return;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let root = tempfile::tempdir().unwrap();
+            let archive_root = root.path().join("archives-root");
+            let mut writer = modelwire_archive::writer::ArchiveWriter::new(
+                archive_root.to_string_lossy().to_string(),
+                modelwire_archive::manifest::CaptureMode::VisibleOnly,
+            )
+            .await
+            .expect("archive writer should initialize");
+
+            let record = modelwire_archive::writer::ConversationRecord {
+                schema: "modelwire.conversation.v1".to_string(),
+                conversation_id: "conv_perm".to_string(),
+                root_response_id: "resp_perm".to_string(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                capture_mode: "visible_only".to_string(),
+                request: modelwire_archive::writer::RequestInfo {
+                    request_id: "req_perm".to_string(),
+                    response_id: "resp_perm".to_string(),
+                    previous_response_id: None,
+                    route_id: None,
+                    target_id: None,
+                    fallback_attempt: None,
+                },
+                models: modelwire_archive::writer::ModelInfo {
+                    downstream_model: "test-model".to_string(),
+                    upstream_model: "test-model".to_string(),
+                    provider_id: "provider-a".to_string(),
+                    provider_name: "Provider A".to_string(),
+                    provider_base_url_hash: "sha256:a".to_string(),
+                    provider_config_hash: "sha256:b".to_string(),
+                    state_scope: "scope-a".to_string(),
+                    wire_api: "responses".to_string(),
+                    detected_wire_api: "responses".to_string(),
+                    upstream_response_id_hash: "sha256:c".to_string(),
+                },
+                routing: modelwire_archive::writer::RoutingInfo {
+                    had_fallback: false,
+                    attempts: vec![],
+                },
+                messages: vec![modelwire_archive::writer::MessageRecord {
+                    role: "assistant".to_string(),
+                    content: vec![json!({"type":"output_text","text":"ok"})],
+                }],
+                tools: vec![],
+                usage: modelwire_archive::writer::UsageInfo {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    reasoning_tokens: 0,
+                },
+                quality: modelwire_archive::writer::QualityInfo {
+                    user_rating: None,
+                    had_error: false,
+                    had_fallback: false,
+                },
+                redaction: modelwire_archive::writer::RedactionStatus {
+                    status: "clean".to_string(),
+                    policy: "default".to_string(),
+                },
+                metadata: None,
+            };
+
+            writer.write_conversation(&record).await.unwrap();
+            let manifest = writer.finalize().await.unwrap();
+
+            let archive_dir = archive_root.join(&manifest.archive_id);
+            let root_mode = std::fs::metadata(&archive_root)
+                .expect("archive root should exist")
+                .permissions()
+                .mode()
+                & 0o777;
+            let archive_dir_mode = std::fs::metadata(&archive_dir)
+                .expect("archive directory should exist")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                root_mode, 0o700,
+                "archive root directory should be owner-only (0700) on unix"
+            );
+            assert_eq!(
+                archive_dir_mode, 0o700,
+                "archive conversation directory should be owner-only (0700) on unix"
+            );
+        }
+    }
+
+    #[test]
+    fn sql_queries_use_parameters_for_user_input() {
+        let janitor_src =
+            std::fs::read_to_string(workspace_root().join("modelwire-server/src/janitor.rs"))
+                .expect("janitor source should be readable");
+
+        assert!(
+            !janitor_src.contains("sqlx::query(&format!("),
+            "janitor must not build SQL by interpolating values into query text"
+        );
+        assert!(
+            !janitor_src.contains("sqlx::query_as(&format!("),
+            "janitor query_as calls must not interpolate user-derived values into SQL text"
+        );
+        assert!(
+            janitor_src.contains("sqlite_delete_by_ids")
+                && janitor_src.contains(".bind(id)")
+                && janitor_src.contains("sqlite_in_placeholders"),
+            "janitor should use placeholder + bind strategy for SQLite IN-clause values"
+        );
+    }
+
+    #[test]
+    fn postgres_tls_required_when_configured() {
+        let remote_disable = modelwire_db::DbPool::connect(
+            "postgres://user:pass@example.com:5432/db?sslmode=disable",
+        );
+        let remote_prefer = modelwire_db::DbPool::connect(
+            "postgres://user:pass@db.example.com:5432/db?sslmode=prefer",
+        );
+        let remote_require = modelwire_db::DbPool::connect(
+            "postgres://user:pass@db.example.com:5432/db?sslmode=require",
+        );
+        let local_disable =
+            modelwire_db::DbPool::connect("postgres://user:pass@localhost:5432/db?sslmode=disable");
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let err_disable = match rt.block_on(remote_disable) {
+            Ok(_) => panic!(
+                "remote postgres with sslmode=disable should fail config validation before connect"
+            ),
+            Err(e) => e,
+        };
+        let err_prefer = match rt.block_on(remote_prefer) {
+            Ok(_) => panic!(
+                "remote postgres with sslmode=prefer should fail config validation before connect"
+            ),
+            Err(e) => e,
+        };
+        let err_local = match rt.block_on(local_disable) {
+            Ok(_) => panic!("local postgres in test should fail to connect without a live DB"),
+            Err(e) => e,
+        };
+        let err_require = match rt.block_on(remote_require) {
+            Ok(_) => panic!("remote postgres in test should fail to connect without a live DB"),
+            Err(e) => e,
+        };
+
+        let disable_text = err_disable.to_string().to_lowercase();
+        let prefer_text = err_prefer.to_string().to_lowercase();
+        let require_text = err_require.to_string().to_lowercase();
+        let local_text = err_local.to_string().to_lowercase();
+
+        assert!(
+            disable_text.contains("remote postgres connections must set sslmode"),
+            "remote sslmode=disable should be rejected by TLS requirement gate"
+        );
+        assert!(
+            prefer_text.contains("remote postgres connections must set sslmode"),
+            "remote sslmode=prefer should be rejected by TLS requirement gate"
+        );
+        assert!(
+            !require_text.contains("remote postgres connections must set sslmode"),
+            "sslmode=require should pass TLS gate (connectivity errors are allowed)"
+        );
+        assert!(
+            !local_text.contains("remote postgres connections must set sslmode"),
+            "localhost should be treated as local and exempt from remote-TLS gate"
+        );
+    }
+}
+
+// ============================================================================
 // Section 28.1.4: Additional Secret Handling Tests
 // ============================================================================
 

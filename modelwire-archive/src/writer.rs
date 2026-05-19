@@ -7,6 +7,19 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tracing::info;
 
+#[cfg(unix)]
+fn set_owner_only_dir_permissions(path: &std::path::Path) -> Result<(), ArchiveError> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o700);
+    std::fs::set_permissions(path, perms).map_err(|e| ArchiveError::IoError(e.to_string()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_dir_permissions(_path: &std::path::Path) -> Result<(), ArchiveError> {
+    Ok(())
+}
+
 /// Archive writer for creating conversation archives.
 pub struct ArchiveWriter {
     root: String,
@@ -34,10 +47,12 @@ impl ArchiveWriter {
 
         // Ensure root directory exists
         fs::create_dir_all(&root).await?;
+        set_owner_only_dir_permissions(std::path::Path::new(&root))?;
 
         // Create archive directory
         let archive_dir = format!("{}/{}", root, archive_id);
         fs::create_dir_all(&archive_dir).await?;
+        set_owner_only_dir_permissions(std::path::Path::new(&archive_dir))?;
 
         let manifest = ArchiveManifest::new(archive_id.clone(), capture_mode);
 
