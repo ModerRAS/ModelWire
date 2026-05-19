@@ -11,4 +11,5 @@ compatibility is the v1 priority.
 Start here:
 
 - [Implementation plan](docs/modelwire-implementation-plan.md)
+- [Public deployment guide](docs/public-deployment-guide.md)
 - [Agent instructions](AGENTS.md)

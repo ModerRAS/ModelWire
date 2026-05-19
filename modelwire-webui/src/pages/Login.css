@@ -1,0 +1,15 @@
+.login-page .logo-text {
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  background: linear-gradient(135deg, var(--text-primary) 0%, var(--accent) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.login-page .form-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}

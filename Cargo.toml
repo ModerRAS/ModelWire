@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = [
+    "modelwire-core",
+    "modelwire-server",
+    "modelwire-adapters",
+    "modelwire-db",
+    "modelwire-archive",
+]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+axum = "0.7"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["request-id", "cors", "trace", "limit"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Tracing & logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres", "chrono", "uuid"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+tokio-stream = "0.1"
+bytes = "1"
+async-trait = "0.1"
+http-body-util = "0.1"
+
+# Hashing
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+
+# Caching
+dashmap = "6"
+arc-swap = "1"
+
+# Compression
+zstd = "0.13"
+
+# Pattern matching
+regex = "1"
+
+# Encryption
+aes-gcm = "0.10"
+rand = "0.8"
+argon2 = "0.5"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["ModelWire Team"]
+license = "MIT OR Apache-2.0"
+description = "A Codex-first Responses API relay"
+repository = "https://github.com/obra/modelwire"
+rust-version = "1.79"

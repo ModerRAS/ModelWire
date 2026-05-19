@@ -1,0 +1,181 @@
+# =============================================================================
+# Dockerfile.example - Reference for custom ModelWire deployments
+#
+# This file documents production deployment patterns. Copy and modify as needed.
+#
+# Security requirements (section 28.1.10):
+# - Run as non-root user
+# - Read-only filesystem except configured data directories
+# - Data directories must be explicitly mounted
+# - Health endpoints must not expose secrets
+# =============================================================================
+
+# =============================================================================
+# Production deployment pattern 1: Read-only filesystem with volumes
+# =============================================================================
+# This pattern provides maximum security by running with a read-only filesystem
+# except for explicitly mounted data directories.
+
+FROM modelwire:latest AS production-readonly
+
+# Override the default command to use environment variables
+# Note: ModelWire primarily uses modelwire.toml for configuration
+# Environment variables can set logging and other runtime options
+CMD ["./modelwire", "serve"]
+
+# =============================================================================
+# Production deployment pattern 2: Docker Compose with read-only filesystem
+# =============================================================================
+# Use this docker-compose.yml for production deployments:
+#
+# version: "3.8"
+#
+# services:
+#   modelwire:
+#     image: modelwire:latest
+#     container_name: modelwire
+#     ports:
+#       - "8787:8787"
+#     volumes:
+#       # Config file (read-only mount)
+#       - /etc/modelwire/modelwire.toml:/app/modelwire.toml:ro
+#       # Data directory (read-write mount - exception to read-only)
+#       - /var/lib/modelwire/data:/app/data:rw
+#     environment:
+#       - RUST_LOG=info
+#     healthcheck:
+#       test: ["CMD", "curl", "-f", "http://localhost:8787/healthz"]
+#       interval: 30s
+#       timeout: 5s
+#       retries: 3
+#       start_period: 10s
+#     restart: unless-stopped
+#     security_opt:
+#       no-new-privileges: true
+#     user: "1000:1000"
+#     read_only: true
+#     tmpfs:
+#       - /tmp:mode=1777
+#
+# =============================================================================
+# Production deployment pattern 3: Kubernetes deployment
+# =============================================================================
+# Use this deployment.yaml for Kubernetes:
+#
+# apiVersion: apps/v1
+# kind: Deployment
+# metadata:
+#   name: modelwire
+# spec:
+#   replicas: 1
+#   selector:
+#     matchLabels:
+#       app: modelwire
+#   template:
+#     metadata:
+#       labels:
+#         app: modelwire
+#     spec:
+#       securityContext:
+#         runAsNonRoot: true
+#         runAsUser: 1000
+#         runAsGroup: 1000
+#         fsGroup: 1000
+#       containers:
+#       - name: modelwire
+#         image: modelwire:latest
+#         ports:
+#         - containerPort: 8787
+#         env:
+#         - name: RUST_LOG
+#           value: "info"
+#         volumeMounts:
+#         - name: config
+#           mountPath: /app/modelwire.toml
+#           subPath: modelwire.toml
+#           readOnly: true
+#         - name: data
+#           mountPath: /app/data
+#         livenessProbe:
+#           httpGet:
+#             path: /healthz
+#             port: 8787
+#           initialDelaySeconds: 10
+#           periodSeconds: 30
+#           timeoutSeconds: 5
+#         readinessProbe:
+#           httpGet:
+#             path: /readyz
+#             port: 8787
+#           initialDelaySeconds: 5
+#           periodSeconds: 10
+#           timeoutSeconds: 3
+#       volumes:
+#       - name: config
+#         secret:
+#           secretName: modelwire-config
+#       - name: data
+#         persistentVolumeClaim:
+#           claimName: modelwire-data
+#
+# =============================================================================
+# Environment variables supported by ModelWire
+# =============================================================================
+# - RUST_LOG: Logging level (info, debug, warn, error)
+# - RUST_BACKTRACE: Enable backtraces (1)
+# - RUST_MIN_STACK: Minimum stack size for async tasks
+#
+# Note: Main configuration is via modelwire.toml, not environment variables.
+# See modelwire.toml.example for all configuration options.
+#
+# =============================================================================
+# Volume mount requirements (section 28.1.10 rule 3)
+# =============================================================================
+# The following directories must be mounted read-write:
+#
+# /app/data          - SQLite database and operational state
+# /app/data/archives - Conversation archives (if archive capture is enabled)
+#
+# Failure to mount these will cause the service to fail or lose data on restart.
+#
+# =============================================================================
+# Health endpoint security (section 28.1.10 rule 4)
+# =============================================================================
+# Health endpoints (/healthz, /readyz) are designed to:
+# - Return only status information (healthy/unhealthy)
+# - NOT expose configuration details
+# - NOT expose API keys or secrets
+# - NOT expose internal paths or structure
+#
+# These endpoints can be safely exposed to load balancers and monitoring systems.
+#
+# =============================================================================
+# TLS and reverse proxy (section 28.1.10 requirement 5)
+# =============================================================================
+# ModelWire does not include TLS termination. Use a reverse proxy:
+#
+# - Caddy: Automatic HTTPS with Let's Encrypt
+# - Nginx: Manual TLS configuration
+# - Cloudflare: DNS-level proxy with TLS
+# - AWS ALB/NLB: Managed load balancer with TLS
+#
+# Required headers for proper operation:
+# - X-Forwarded-For: Client IP for rate limiting
+# - X-Forwarded-Proto: https for proper URL construction
+# - X-Request-ID: Request correlation for logging
+#
+# =============================================================================
+# Backup and disaster recovery
+# =============================================================================
+# Critical data to backup:
+# 1. modelwire.toml (or equivalent config secret)
+# 2. /app/data/modelwire.db (SQLite database)
+# 3. /app/data/archives/ (if using archive capture)
+#
+# Recommended backup schedule:
+# - Database: Every 15 minutes (use sqlx backup or sqlite3 .backup)
+# - Archives: Daily incremental, weekly full
+#
+# Never backup raw API keys - they should be stored securely in secrets management.
+#
+# =============================================================================

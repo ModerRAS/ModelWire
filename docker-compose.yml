@@ -1,0 +1,37 @@
+# Docker Compose for local ModelWire development
+#
+# Usage:
+#   docker compose up          # Start services
+#   docker compose down        # Stop services
+#   docker compose down -v     # Stop and remove volumes
+#
+version: "3.8"
+
+services:
+  modelwire:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: modelwire:latest
+    container_name: modelwire
+    ports:
+      - "8787:8787"
+    volumes:
+      # Mount config file (read-only)
+      - ./modelwire.toml.example:/app/modelwire.toml:ro
+      # Mount data directory for SQLite database and archives (read-write)
+      - ./data:/app/data:rw
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8787/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    security_opt:
+      # Run as non-root (security requirement from 28.1.10)
+      - "no-new-privileges:true"
+    user: "1000:1000"

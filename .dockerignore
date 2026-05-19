@@ -1,0 +1,45 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+target/
+**/target/
+
+# WebUI build
+modelwire-webui/node_modules/
+modelwire-webui/src/
+modelwire-webui/public/
+modelwire-webui/index.html
+modelwire-webui/package*.json
+modelwire-webui/tsconfig*.json
+modelwire-webui/vite.config.ts
+modelwire-webui/eslint.config.js
+modelwire-webui/README.md
+
+# Development files
+.sisyphus/
+.github/
+docs/
+*.md
+LICENSE
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Rust
+.rustfmt.toml
+deny.toml
+
+# Docker
+.dockerignore
+Dockerfile*
+docker-compose*.yml
+
+# Temporary files
+*.log
+*.tmp
+*.bak

@@ -1,6 +1,6 @@
 # ModelWire implementation plan
 
-Last updated: 2026-05-16
+Last updated: 2026-05-19
 
 This document is the implementation specification for ModelWire. It is intentionally
 very detailed because future implementers may only be able to follow explicit
@@ -304,6 +304,10 @@ Example TOML:
 bind = "0.0.0.0:8787"
 public_base_url = "https://modelwire.example.com"
 database_url = "sqlite://modelwire.db"
+compaction_mode = "native_responses"
+local_summary_model = "modelwire-local-summary"
+local_summary_prompt_version = "v1"
+local_summary_max_chars = 4000
 
 [security]
 admin_auth = "local_password"
@@ -311,6 +315,18 @@ downstream_auth = "relay_key"
 allow_passthrough_keys = true
 log_prompts = false
 log_tool_outputs = false
+log_secret = "replace-with-real-secret"
+ip_requests_per_minute = 240
+trusted_passthrough_header = "x-gateway-token"
+trusted_passthrough_value = "replace-with-gateway-token"
+
+[[security.relay_keys]]
+key_hash = "2f7b8a4c"
+allowed_models = ["gpt-5.5"]
+allowed_providers = ["openai-direct"]
+requests_per_minute = 120
+max_concurrency = 8
+archive_capture_mode = "metadata_only"
 
 [[providers]]
 id = "openai-direct"
@@ -363,6 +379,122 @@ auto_compact_recommended_tokens = 150000
 token_estimator = "approx"
 context_overflow_policy = "reject"
 ```
+
+### 9.1 Compaction Config Fields
+
+`server.compaction_mode`
+  Type: `string`
+  Default: `"native_responses"`
+  Security implication: `"local_summary"` and `"hybrid"` can persist compacted
+  transcript summaries; keep archives/log redaction enabled.
+  Example TOML: `compaction_mode = "hybrid"`
+
+`server.local_summary_model`
+  Type: `string | null`
+  Default: `null` (runtime fallback: `"modelwire-local-summary"`)
+  Security implication: recorded in compaction lineage; should not contain
+  secrets or internal credentials.
+  Example TOML: `local_summary_model = "summary-router-v1"`
+
+`server.local_summary_prompt_version`
+  Type: `string | null`
+  Default: `null` (runtime fallback: `"v1"`)
+  Security implication: lineage metadata only; use stable version tags.
+  Example TOML: `local_summary_prompt_version = "2026-05-compact-v2"`
+
+`server.local_summary_max_chars`
+  Type: `integer`
+  Default: `4000`
+  Security implication: larger values may retain more sensitive transcript
+  content in summary output.
+  Example TOML: `local_summary_max_chars = 6000`
+
+### 9.2 Relay Key Scope Config Fields
+
+`security.log_secret`
+  Type: `string | null`
+  Default: `null`
+  Security implication: used when hashing downstream relay keys for matching
+  and logging; must be high-entropy and managed as a secret.
+  Example TOML: `log_secret = "replace-with-real-secret"`
+
+`security.relay_keys`
+  Type: `array<table>`
+  Default: `[]`
+  Security implication: when non-empty, only keys whose hash matches an enabled
+  entry are accepted; route/provider scoping is enforced before relay execution.
+  Example TOML:
+  `[[security.relay_keys]] key_hash = "2f7b8a4c" allowed_models = ["gpt-5.5"]`
+
+`security.relay_keys.key_hash`
+  Type: `string`
+  Default: required
+  Security implication: stores only key hash, never plaintext relay key.
+  Example TOML: `key_hash = "2f7b8a4c"`
+
+`security.relay_keys.enabled`
+  Type: `boolean`
+  Default: `true`
+  Security implication: disabled entries are ignored for authentication and
+  authorization.
+  Example TOML: `enabled = true`
+
+`security.relay_keys.allowed_models`
+  Type: `array<string>`
+  Default: `[]` (empty means all configured routes)
+  Security implication: if non-empty, requests to other downstream model aliases
+  return `403`.
+  Example TOML: `allowed_models = ["gpt-5.5", "gpt-5.5-mini"]`
+
+`security.relay_keys.allowed_providers`
+  Type: `array<string>`
+  Default: `[]`
+  Security implication: when non-empty, requests are limited to routes that
+  include at least one allowed provider and relay target selection is filtered
+  to those providers.
+  Example TOML: `allowed_providers = ["openai-direct"]`
+
+`security.relay_keys.requests_per_minute`
+  Type: `integer | null`
+  Default: `null`
+  Security implication: when set, requests above this per-minute key budget are
+  rejected with `429 rate_limited`.
+  Example TOML: `requests_per_minute = 120`
+
+`security.relay_keys.max_concurrency`
+  Type: `integer | null`
+  Default: `null`
+  Security implication: when set, concurrent in-flight requests above this key
+  cap are rejected with `429 rate_limited`.
+  Example TOML: `max_concurrency = 8`
+
+`security.relay_keys.archive_capture_mode`
+  Type: `string | null`
+  Default: `null`
+  Security implication: optional per-key archive policy marker; should not be
+  elevated without explicit operator intent.
+  Example TOML: `archive_capture_mode = "metadata_only"`
+
+`security.trusted_passthrough_header`
+  Type: `string | null`
+  Default: `null`
+  Security implication: identifies the required gateway-control header for
+  `trusted_passthrough`; missing/invalid config disables safe entry.
+  Example TOML: `trusted_passthrough_header = "x-gateway-token"`
+
+`security.trusted_passthrough_value`
+  Type: `string | null`
+  Default: `null`
+  Security implication: shared secret value for trusted passthrough gate; treat
+  as credential and never log raw value.
+  Example TOML: `trusted_passthrough_value = "replace-with-gateway-token"`
+
+`security.ip_requests_per_minute`
+  Type: `integer | null`
+  Default: `null`
+  Security implication: when set, requests above the per-client-IP minute
+  budget are rejected with `429 rate_limited`.
+  Example TOML: `ip_requests_per_minute = 240`
 
 Rules:
 
@@ -3929,16 +4061,357 @@ Framework behavior currently in place:
    explicit target protocols.
 2. Route and target config are snapshotted at request start.
 3. The first explicit target protocol can be native Responses, OpenAI Chat, or
-   Anthropic. `wire_api = "auto"` returns an explicit protocol error until the
-   lazy probe framework is filled.
+   Anthropic. `wire_api = "auto"` now resolves lazily with cache key
+   `provider_id + credential_hash + upstream_model`, probe order
+   `responses -> anthropic -> openai_chat`, and explicit stop behavior for
+   auth failures (`401/403`).
 4. Upstream responses are normalized to ModelWire-owned downstream response,
    message, and tool-call IDs. Upstream IDs remain private.
-5. `previous_response_id` returns an explicit scaffold error until state
-   ownership and replay are implemented.
-6. The database write is intentionally a shell write through
-   `modelwire_db::repo::responses::store_response`; later work must replace or
-   extend it with route, target, upstream handle, usage, and transcript item
-   persistence.
+5. `previous_response_id` continuation now resolves persisted ModelWire-owned
+   state, supports safe same-upstream handle reuse, and falls back to canonical
+   replay when direct handle reuse is not safe or fails before commit.
+6. Response shell persistence now stores route/target/provider/upstream metadata
+   plus usage and stores upstream response handles in the private
+   `upstream_handles` operational table. Upstream response IDs remain hidden
+   from downstream JSON.
+7. Non-streaming `previous_response_id` continuation now resolves local
+   response state, returns `404 state_not_found` for missing chain state, uses
+   same-target upstream handle continuation when safe, and falls back to
+   visible canonical replay when the upstream handle is rejected.
+8. `stream = true` now uses a dedicated relay path that emits downstream
+   Responses-style SSE events, allows pre-commit fallback to later targets, does
+   not fallback after the first semantic downstream event has been emitted, and
+   enforces `stream_idle_timeout_secs` plus `max_stream_duration_secs` with
+   post-commit failures mapped to downstream `response.failed` events.
+9. Continuation tool-result validation now rejects unknown `call_id` values with
+   `400 tool_mapping_failed` before any upstream call is attempted.
+10. Context guard now runs before upstream calls. It estimates request/token
+    budget conservatively per target and enforces `context_overflow_policy`
+    (`reject` or `fallback`) before any upstream HTTP attempt.
+11. Additional context-guard slice coverage now verifies:
+    `context_guard_does_not_mark_protocol_unsupported`,
+    `materialized_replay_budget_includes_history`, and
+    `tool_schema_budget_counts_against_context`.
+12. `/v1/models` now reports conservative context metadata per downstream route
+    (minimum safe context/max-output across enabled targets) and context
+    overflow paths are verified with `no_silent_truncation`.
+13. `POST /v1/responses/compact` now routes through a capability-gated relay
+    path: only targets resolving to native Responses are eligible, Chat and
+    Anthropic targets are skipped, and missing support returns a stable
+    `400 protocol_not_supported`.
+14. Compact source lineage guard now prevents cross-provider/cross-`state_scope`
+    replay: when compact requests reference local response state
+    (`response_id`/`previous_response_id`), ModelWire requires provider +
+    `state_scope` compatibility before forwarding upstream.
+15. Added compact-focused slice coverage:
+    `native_compact_not_sent_to_chat_or_anthropic`,
+    `native_compact_not_replayed_across_state_scope`,
+    `native_compact_forwarded_only_to_compatible_responses_target`,
+    `missing_compact_support_falls_back_to_context_policy`,
+    route-level forwarding success for compatible native targets, and
+    route-level rejection when only non-compatible targets are configured.
+16. Added configurable compaction modes in server config:
+    `none`, `native_responses`, `local_summary`, `hybrid`.
+    `hybrid` now prefers native Responses compaction and falls back to explicit
+    local-summary compaction.
+17. Added `compaction_lineage` operational persistence and local-summary
+    lineage coverage (`local_summary_marks_lineage`) including source response
+    IDs, summarizer model, prompt version, and token counts.
+18. Added streaming timeout slice coverage:
+    `streaming_idle_timeout_before_commit_falls_back_to_second_target` and
+    `streaming_max_duration_after_commit_emits_failed_without_fallback`.
+19. Added scoped relay-key authorization for downstream API:
+    `security.relay_keys` now supports per-key model + provider scopes.
+    Requests return strict `403` when the key lacks model permission or when
+    no route target provider is allowed for that key.
+20. Added trusted passthrough hard gate enforcement:
+    `trusted_passthrough` now requires configured extra control header/value
+    and is covered by `trusted_passthrough_requires_extra_gate`.
+21. Added enforced per-key throttling:
+    `security.relay_keys.requests_per_minute` and `max_concurrency` now enforce
+    runtime limits and return `429 rate_limited` when exceeded; covered by
+    strict security tests `rate_limit_by_key_returns_429` and
+    `concurrency_limit_by_key_returns_429`.
+22. Added enforced per-IP throttling:
+    `security.ip_requests_per_minute` now enforces runtime per-minute limits
+    keyed by client IP identity (`x-forwarded-for` first hop, then `x-real-ip`,
+    else `unknown`) and returns `429 rate_limited` when exceeded; covered by
+    strict security test `rate_limit_by_ip_returns_429`.
+23. Added managed-key-missing guard:
+    targets configured with `auth_mode = "managed"` now fail fast with
+    `500 internal_error` if the provider key is missing, emit redacted
+    `provider_key_missing` audit logs, and do not attempt upstream calls.
+24. Added strict admin API auth + CSRF middleware:
+    `/admin/api/*` now requires `admin_auth = "local_password"` credentials and
+    rejects missing/invalid admin auth with `401`; state-changing methods
+    (`POST`/`PUT`/`PATCH`/`DELETE`) require matching `admin_csrf` cookie and
+    `x-csrf-token` header (plus presence of `admin_session`) and return `403`
+    when the CSRF check fails.
+25. Added admin security slice coverage hardening:
+    `admin_api_requires_auth` now asserts strict unauthorized behavior for
+    missing/invalid credentials and success for valid credentials;
+    `admin_post_without_csrf_rejected` now asserts strict `403` without CSRF
+    and success when cookie/header CSRF tokens match.
+26. Added real startup/public-auth hardening:
+    server startup now validates public bind + auth combinations and rejects
+    `downstream_auth = "none"` on public bind/public deployment; public
+    deployment with passthrough auth now requires
+    `allow_passthrough_keys = true`.
+27. Added admin same-origin guard and strict origin tests:
+    `/admin/api/*` now rejects untrusted browser `Origin` values by default and
+    allows only configured `server.public_base_url` origin (or localhost
+    fallback when base URL is unset); `admin_cors_rejects_untrusted_origin`
+    now asserts real router behavior instead of simulation.
+28. Replaced simulation-style security checks with runtime assertions:
+    `public_bind_without_auth_fails_startup` now exercises real `serve(...)`
+    startup validation and `passthrough_disabled_rejects_public_request` now
+    asserts strict runtime rejection behavior (`403`) through middleware.
+29. Added real admin config-import validation path:
+    `POST /admin/api/config/import` now parses full config payload, rejects
+    partial/invalid records (`400 request_invalid`), validates provider/route
+    referential integrity, and enforces provider URL SSRF checks before
+    reporting import success.
+30. Hardened config-import security test to runtime API behavior:
+    `config_import_rejects_partial_invalid_payload` now performs authenticated
+    admin requests and asserts server-side rejection for missing provider IDs,
+    duplicate provider IDs, and SSRF-blocked provider URLs, plus success for a
+    fully valid payload.
+31. Replaced provider admin stubs with validated runtime behavior:
+    `/admin/api/providers` create/read/update/delete now validates payloads,
+    returns `404 state_not_found` for unknown provider IDs, and enforces SSRF
+    validation for provider base URLs (unless explicit `skip_ssrf_validation`).
+32. Added runtime admin-provider SSRF tests:
+    authenticated admin provider-creation requests now assert `400` for
+    localhost/private URLs and `201` for valid HTTPS provider URLs.
+33. Replaced route/target admin stubs with validated runtime behavior:
+    `/admin/api/routes` and `/admin/api/targets/*` now parse typed payloads,
+    enforce provider reference validation, validate `wire_api` and
+    `context_overflow_policy`, produce deterministic route/target IDs, and
+    return `404 state_not_found` for unknown route/target IDs.
+34. Added runtime admin route/target security coverage:
+    authenticated admin CRUD tests now assert real status behavior for route
+    and target validation failures, unknown IDs (`404`), and successful create/
+    update/delete flows under auth + CSRF + same-origin middleware.
+35. Added probe single-flight for concurrent identical auto-detection:
+    protocol resolution now uses per-cache-key probe locks so concurrent
+    requests sharing `(provider_id, credential_hash, upstream_model)` collapse
+    to one upstream probe sequence while waiters reuse the resulting cache/db
+    record.
+36. Added runtime single-flight probe test coverage:
+    `probe_concurrent_identical_requests_single_flight` verifies concurrent
+    identical `WireApi::Auto` resolution triggers exactly one `/responses`
+    probe and one fallback `/messages` probe, with both callers receiving the
+    same resolved protocol.
+37. Hardened admin probe refresh behavior:
+    `POST /admin/api/probes/refresh` now clears both in-memory probe cache and
+    probe-lock state, deletes persisted `probe_results` rows, and returns
+    deterministic JSON with `persisted_cleared` row count.
+38. Added runtime admin probe-refresh persistence test:
+    `admin_refresh_probes_clears_cache_and_persisted_rows` verifies authenticated
+    admin refresh clears cache entries, lock entries, and persisted probe rows
+    in SQLite-backed operational state.
+39. Implemented transactional admin config-apply for import:
+    validated config import now replaces operational `providers`, `routes`, and
+    `route_targets` tables in a single DB transaction and returns applied row
+    counts (`providers`, `routes`, `targets`) in import response JSON.
+40. Strengthened config-import runtime verification:
+    `config_import_rejects_partial_invalid_payload` now asserts successful import
+    response includes applied counts and verifies imported provider records are
+    persisted and queryable from operational DB state.
+41. Migrated admin route and target CRUD endpoints to DB-backed operational state:
+    `/admin/api/routes`, `/admin/api/routes/{id}`, `/admin/api/routes/{id}/targets`,
+    and `/admin/api/targets/{id}` now read/write `routes` and `route_targets`
+    through repository methods, validate provider references against persisted
+    providers, and return persisted route/target projections (including target
+    metadata decoded from persisted `config_json`).
+42. Added DB-seeded admin security fixture bootstrap:
+    `build_public_state` now applies config into operational tables via
+    transactional `replace_admin_config` so admin CRUD/security tests execute
+    against persisted providers/routes/targets rather than only in-memory config.
+43. Strengthened runtime admin route/target persistence checks:
+    `admin_route_crud_enforces_validation_and_not_found` and
+    `admin_target_crud_enforces_validation_and_not_found` now assert DB read-back
+    after create/update/delete, and
+    `admin_target_priority_update_changes_db_order` verifies target priority
+    updates persist and reorder route target retrieval deterministically.
+44. Implemented DB-backed admin request log listing:
+    `/admin/api/logs` now returns persisted `request_logs` rows (newest first,
+    paginated by `limit`) and total count from operational state instead of stub
+    output, preserving redacted-by-default fields (hashes/metadata only).
+45. Added runtime admin logs redaction coverage:
+    `admin_logs_endpoint_returns_redacted_request_logs` verifies authenticated
+    admin log retrieval returns persisted rows with hashed key material and no
+    raw bearer/relay key leakage in the response body.
+46. Implemented persisted probe status listing for admin API:
+    `/admin/api/probes` now merges non-expired persisted `probe_results` rows
+    (provider, credential hash, upstream model, detected wire API, capability
+    flags, last success/failure, failure metadata, expiry) with cache-only
+    entries, so probe status screens are no longer limited to in-memory cache.
+47. Added runtime probe-list status coverage:
+    `admin_list_probes_includes_persisted_status_fields` verifies authenticated
+    admin probe listing returns persisted probe records including protocol and
+    capability/status fields needed by the probe status UI.
+48. Hardened upstream redirect handling in relay data plane:
+    all upstream HTTP clients used by non-streaming, streaming, compact, and
+    probe paths now disable automatic redirect following (`Policy::none`) so
+    ModelWire never silently follows provider-issued redirects.
+49. Added runtime SSRF redirect coverage:
+    `upstream_redirect_to_private_ip_rejected` now uses two mock upstream
+    servers and verifies a `302` Location redirect is not followed and returns
+    `502 upstream_unavailable` instead of reaching the redirected host.
+50. Implemented production archive segment sealing in `modelwire-archive`:
+    conversation segments are finalized as `conversations-*.jsonl.zst`,
+    checksums are computed from compressed bytes, and `manifest.json` is
+    persisted on every segment close (not only final shutdown).
+51. Hardened archive path safety in writer:
+    relative archive segment paths are validated to reject traversal/absolute
+    forms before write, and traversal coverage is enforced by
+    `validate_archive_relative_path_rejects_traversal`.
+52. Wired non-streaming relay success path to best-effort archive capture:
+    `archive_successful_response` now applies configured capture mode
+    (`off`, `metadata_only`, `visible_only`, `full_visible`, `debug_raw`),
+    redacts archived visible content, hashes upstream IDs/base URLs by default,
+    blocks `debug_raw` on public bind, and logs archive failures without
+    failing downstream response delivery.
+53. Added runtime archive relay coverage:
+    `archive_capture_mode_off_writes_no_archive_files` verifies `off` writes
+    nothing, and
+    `archive_capture_visible_only_writes_redacted_visible_record` verifies
+    `visible_only` writes redacted `.jsonl.zst` records with lineage fields.
+54. Fixed archive lineage hashing to use upstream-private response handle:
+    archive `models.upstream_response_id_hash` now derives from the captured
+    upstream response ID handle (when present), not the downstream
+    ModelWire-owned response ID.
+55. Implemented scoped archive capture-mode override from relay key auth:
+    `security.relay_keys.archive_capture_mode` now flows from downstream auth
+    context into non-stream relay archive writes and can override global
+    `archive.capture_mode` for that request.
+56. Added archive capture-mode edge coverage for required modes:
+    `archive_capture_metadata_only_excludes_visible_messages`,
+    `archive_capture_full_visible_keeps_full_tool_result`, and
+    `archive_debug_raw_public_bind_is_best_effort_non_blocking` verify mode
+    semantics and non-blocking archive-failure behavior.
+57. Added runtime auth-to-archive override coverage:
+    `relay_key_auth_context_includes_archive_capture_mode_override` verifies
+    relay-key scoped capture policy reaches runtime archive output behavior.
+58. Upgraded logging/archive security tests from intent checks to runtime checks:
+    `archive_capture_disabled_by_default`,
+    `debug_raw_fails_on_public_bind_without_unsafe_flag`, and
+    `probe_request_not_archived` now execute real router + upstream + archive
+    flows and assert concrete archive filesystem outputs.
+59. Added runtime archive checks for reasoning exclusion and checksum integrity:
+    `hidden_reasoning_not_archived` now verifies visible archive records exclude
+    reasoning output items/content, and
+    `archive_manifest_checksum_validates` now verifies manifest checksum fields
+    against the finalized compressed segment bytes.
+60. Implemented filesystem-based archive index rebuild capability in
+    `modelwire-archive` and runtime coverage:
+    `rebuild_archive_index_from_files` now scans archive directories,
+    validates manifest schema + segment checksums, and reconstructs deterministic
+    index metadata; security test `archive_index_rebuild_from_files` now calls
+    this real rebuild path against generated archive artifacts.
+61. Persisted and surfaced full probe capability metadata:
+    probe result storage now carries `supports_parallel_tool_calls` and
+    `supports_reasoning_summary` end-to-end through probe persistence, admin
+    probe listings, and runtime probe cache hydration; covered by
+    `persisted_probe_roundtrip_keeps_parallel_and_reasoning_summary_flags` and
+    `admin_list_probes_includes_persisted_status_fields`.
+62. Added tool-bearing request target-eligibility guard for auto-detected
+    targets:
+    routing now skips targets when probe metadata indicates tool support is
+    unknown/unsupported for a request that includes tools (instead of silently
+    stripping tools), preserving fallback behavior and returning
+    `protocol_not_supported` when no eligible target remains; covered by
+    `tool_request_skips_auto_target_with_unknown_tool_support`.
+63. Added synthetic probe visibility for forced `wire_api` targets:
+    forced protocol resolution now skips network probing but records a
+    synthetic success probe record in cache + DB for admin visibility, keyed by
+    provider + credential hash + upstream model; covered by
+    `forced_wire_api_records_synthetic_probe_visibility`.
+64. Added fallback-attempt lineage capture in non-stream relay archiving:
+    archive records now include all attempted targets (failed + winner) with
+    per-attempt status/error/latency, set `routing.had_fallback` and
+    `quality.had_fallback` correctly, and record winner attempt index via
+    `request.fallback_attempt`; covered by runtime security slice
+    `archive_lineage_records_all_attempts_and_winner_on_fallback`.
+65. Added runtime request-log fallback-attempt coverage:
+    pre-commit fallback requests are now explicitly verified to persist both
+    failed-first-target and successful-fallback-target `request_logs` rows
+    under one request ID, covering Milestone 6 attempt-log acceptance with
+    `request_logs_record_all_fallback_attempts_before_commit`.
+66. Added runtime route-snapshot stability coverage for in-flight requests:
+    while a delayed `/v1/responses` request is executing, an authenticated admin
+    route edit is applied; the in-flight request still completes via the
+    originally selected target, proving running-request snapshot stability and
+    no mid-flight route mutation effect. Covered by
+    `running_request_keeps_route_snapshot_when_admin_edits_route`.
+67. Added runtime multi-tool order preservation coverage for Chat adapter:
+    non-stream Chat responses containing multiple `tool_calls` are now verified
+    to produce downstream Responses `function_call` output items in the same
+    received order, covering Milestone 4 parallel-tool-order acceptance with
+    `chat_parallel_tool_calls_preserve_order_received`.
+68. Added runtime Anthropic streaming tool-input delta coverage:
+    Anthropic `content_block_delta` events carrying `input_json_delta` are now
+    verified end-to-end to emit downstream Responses
+    `response.function_call_arguments.delta` SSE events with JSON fragments,
+    covering Milestone 8 streaming tool-input mapping acceptance via
+    `anthropic_streaming_tool_input_maps_to_argument_deltas`.
+69. Added runtime Anthropic usage-mapping coverage:
+    non-stream Anthropic responses with usage fields (including
+    `thinking_tokens`) are now verified end-to-end to populate downstream
+    Responses usage (`input_tokens`, `output_tokens`, `total_tokens`,
+    `reasoning_tokens`), covering Milestone 8 usage-mapping acceptance via
+    `anthropic_usage_maps_to_downstream_usage`.
+70. Added runtime WebUI backend-serving coverage:
+    `webui_root_redirects_to_admin_login` verifies `/` redirects to
+    `/admin/login`, and `webui_dist_index_served_by_backend` verifies the Rust
+    backend serves `modelwire-webui/dist/index.html` for admin WebUI routes,
+    covering Milestone 9 acceptance item 10.
+71. Added real Docker and deployment-guide coverage:
+    `docker_starts_with_config` now reads the checked-in Dockerfile and
+    `.dockerignore` to verify the container starts ModelWire with an explicit
+    config path while keeping WebUI dist assets in the build context, and the
+    new public deployment guide documents TLS, reverse proxy, auth, rate
+    limits, backup sensitivity, and archive sensitivity.
+72. Added runtime CLI parsing coverage for container startup arguments:
+    `cli_accepts_config_before_serve_subcommand` and
+    `cli_defaults_to_modelwire_toml` now verify the actual Clap parser accepts
+    `--config ... serve` (the Docker entrypoint shape) and defaults to
+    `modelwire.toml` when config is omitted.
+73. Added runtime hidden-reasoning non-exposure coverage for downstream output:
+    `hidden_reasoning_not_exposed_as_assistant_text` verifies reasoning-summary
+    text returned by upstream is not emitted as downstream assistant
+    `output_text`, strengthening Public alpha acceptance item 13 with a direct
+    response-payload assertion.
+74. Replaced simulated managed-key-at-rest check with runtime DB/API assertions:
+    `managed_upstream_key_encrypted_at_rest` now creates a managed provider via
+    authenticated admin API, then verifies persisted provider rows do not store
+    plaintext upstream keys (only `api_key_set` marker metadata) and provider
+    read responses do not expose raw key material.
+75. Replaced simulated health/readiness/metrics secret checks with runtime API
+    assertions:
+    `healthz_does_not_expose_config`, `readyz_does_not_expose_config`, and
+    `metrics_do_not_include_raw_key_or_prompt` now execute the real router and
+    assert emitted payloads do not leak secret/config markers, strengthening
+    Public alpha acceptance around operational endpoint safety.
+76. Enforced `413 request_too_large` for oversized downstream JSON bodies:
+    `/v1/responses` and `/v1/responses/compact` now map body length-limit read
+    failures to `request_too_large` (instead of generic `request_invalid`), and
+    runtime route slice `create_response_rejects_oversized_body_with_413`
+    verifies no upstream attempt occurs and downstream error code/status match
+    section 37.1 request parsing requirements.
+77. Hardened runtime SSRF validation + provider-override behavior:
+    core SSRF host parsing now correctly handles bracketed IPv6 hosts and
+    metadata hostnames (for example `metadata.google.internal`), and
+    `validate_provider_url_for_provider(..., allow_private_ips = true)` now
+    reuses parsed host data correctly so explicit private-IP opt-in works as
+    configured. Runtime/security coverage is now enforced by
+    `ssrf::tests::*` and `security_tests::ssrf_protection::*`, including
+    `provider_url_rejects_localhost_by_default`,
+    `provider_url_rejects_private_ip_by_default`,
+    `provider_url_rejects_metadata_ip_by_default`,
+    `provider_url_allows_private_ip_with_explicit_allow_flag`, and
+    `upstream_redirect_to_private_ip_rejected`.
 
 Next small-model implementation tasks should target these exact seams:
 

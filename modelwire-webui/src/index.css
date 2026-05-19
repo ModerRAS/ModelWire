@@ -1,0 +1,15 @@
+/* Base styles are in Layout.css */
+#root {
+  width: 100%;
+  max-width: 100%;
+  margin: 0;
+  text-align: left;
+  border: none;
+  min-height: 100vh;
+  display: block;
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
