@@ -4444,6 +4444,12 @@ Framework behavior currently in place:
     response IDs while operational DB rows (`responses` and `upstream_handles`)
     persist provider/upstream metadata and the upstream response handle for
     continuation.
+82. Hardened archive JSON redaction for nested objects and arrays:
+    `modelwire-archive::redact_json` now recurses into non-sensitive object
+    values and array elements so nested `password`/`api_key`/`token` fields are
+    redacted consistently; security tests
+    `redact_json_handles_nested_objects` and `redact_json_handles_arrays` now
+    assert strict nested redaction behavior instead of documenting a known gap.
 
 Next small-model implementation tasks should target these exact seams:
 

@@ -3826,10 +3826,6 @@ mod secret_redaction {
 
     #[test]
     fn redact_json_handles_nested_objects() {
-        // Note: The current redact_json implementation only redacts top-level
-        // sensitive keys. Nested redaction is not fully implemented.
-        // This test documents the current behavior.
-
         let json = json!({
             "user": {
                 "credentials": {
@@ -3842,9 +3838,8 @@ mod secret_redaction {
 
         let redacted = redact_json(&json);
 
-        // Current behavior: only top-level sensitive keys are redacted
-        // Nested keys like user.credentials.password are not redacted
-        assert_eq!(redacted["user"]["credentials"]["password"], "secret"); // Not redacted yet
+        assert_eq!(redacted["user"]["credentials"]["password"], "[REDACTED]");
+        assert_eq!(redacted["user"]["credentials"]["api_key"], "[REDACTED]");
         assert_eq!(redacted["public"], "data");
 
         // Top-level sensitive key should be redacted
@@ -3858,9 +3853,6 @@ mod secret_redaction {
 
     #[test]
     fn redact_json_handles_arrays() {
-        // Note: Current implementation may not fully handle arrays of objects
-        // with sensitive fields. This test documents the expected behavior.
-
         let json = json!({
             "users": [
                 {"name": "Alice", "api_key": "key1"},
@@ -3872,9 +3864,8 @@ mod secret_redaction {
 
         let users = redacted["users"].as_array().unwrap();
         assert_eq!(users[0]["name"], "Alice");
-        // Current behavior may or may not redact api_key based on implementation
-        let alice_api_key = &users[0]["api_key"];
-        assert!(alice_api_key.is_string());
+        assert_eq!(users[0]["api_key"], "[REDACTED]");
+        assert_eq!(users[1]["api_key"], "[REDACTED]");
     }
 
     #[tokio::test]

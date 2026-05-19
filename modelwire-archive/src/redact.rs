@@ -117,7 +117,7 @@ pub fn redact_json_value(key: &str, value: &serde_json::Value) -> serde_json::Va
     if sensitive_keys.iter().any(|s| key.to_lowercase() == *s) {
         serde_json::Value::String("[REDACTED]".to_string())
     } else {
-        value.clone()
+        redact_json(value)
     }
 }
 
@@ -178,9 +178,19 @@ mod tests {
         let json = serde_json::json!({
             "api_key": "secret123",
             "name": "test",
+            "nested": {
+                "token": "nested-secret"
+            },
+            "items": [
+                {"password": "array-secret"},
+                {"value": "ok"}
+            ]
         });
         let redacted = redact_json(&json);
         assert_eq!(redacted["api_key"], "[REDACTED]");
         assert_eq!(redacted["name"], "test");
+        assert_eq!(redacted["nested"]["token"], "[REDACTED]");
+        assert_eq!(redacted["items"][0]["password"], "[REDACTED]");
+        assert_eq!(redacted["items"][1]["value"], "ok");
     }
 }
