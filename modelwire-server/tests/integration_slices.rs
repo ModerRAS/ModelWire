@@ -1949,6 +1949,503 @@ mod fallback_429_tests {
     }
 }
 
+// ============================================================================
+// Test 8: no_fallback_after_sse_commit
+// ============================================================================
+
+mod no_fallback_after_commit_tests {
+    use super::*;
+
+    /// Verifies that once streaming is committed (response.created emitted),
+    /// upstream failure does not trigger fallback to the next target.
+    #[tokio::test]
+    async fn no_fallback_after_sse_commit() {
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "event: response.created\n\
+                 data: {\"response\":{\"id\":\"resp_committed\",\"model\":\"gpt-upstream\",\"created_at\":1}}\n\n\
+                 event: response.output_item.added\n\
+                 data: {\"item\":invalid_json}\n\n",
+            ))
+            .expect(1)
+            .mount(&first)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "event: response.created\n\
+                 data: {\"response\":{\"id\":\"resp_should_not_fallback\",\"model\":\"gpt-upstream\",\"created_at\":1}}\n\n",
+            ))
+            .expect(0)
+            .mount(&second)
+            .await;
+
+        let state = Arc::new(build_state_with_two_targets(&first.uri(), &second.uri()).await);
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "codex-main",
+                    "input": "stream and commit",
+                    "stream": true
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let sse = String::from_utf8_lossy(&body);
+        assert!(sse.contains("event: response.created"));
+        assert!(
+            sse.contains("event: response.failed"),
+            "post-commit failure should be surfaced, not fallback"
+        );
+        assert!(
+            !sse.contains("resp_should_not_fallback"),
+            "second target must not be called after commit"
+        );
+    }
+}
+
+// ============================================================================
+// Test 9: model_mapping_capture
+// ============================================================================
+
+mod model_mapping_capture_tests {
+    use super::*;
+
+    /// Verifies downstream model alias maps to configured upstream model and
+    /// upstream request captures mapped model value.
+    #[tokio::test]
+    async fn model_mapping_capture() {
+        let upstream = MockServer::start().await;
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                *captured_clone.lock().unwrap() = Some(body);
+
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "resp_model_map",
+                    "model": "gpt-upstream",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_model_map",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "mapped"}]
+                    }],
+                    "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}
+                }))
+            })
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(build_test_state(&upstream.uri()).await);
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "codex-main",
+                    "input": "capture model mapping"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let response_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            response_json.get("model").and_then(|v| v.as_str()),
+            Some("codex-main"),
+            "downstream response model should remain downstream alias"
+        );
+
+        let upstream_body = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("upstream request should be captured");
+        assert_eq!(
+            upstream_body.get("model").and_then(|v| v.as_str()),
+            Some("gpt-upstream"),
+            "upstream request should use mapped upstream model"
+        );
+    }
+}
+
+// ============================================================================
+// Test 10: auth header rewrite
+// ============================================================================
+
+mod auth_header_rewrite_tests {
+    use super::*;
+
+    /// Verifies downstream Authorization is passed to OpenAI-compatible upstream
+    /// as Authorization when provider auth_mode is pass_authorization.
+    #[tokio::test]
+    async fn auth_header_rewrite_openai() {
+        let upstream = MockServer::start().await;
+        let captured_auth = Arc::new(std::sync::Mutex::new(None));
+        let captured_auth_clone = Arc::clone(&captured_auth);
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |req: &wiremock::Request| {
+                let auth = req
+                    .headers
+                    .iter()
+                    .find_map(|(k, v)| {
+                        if k.as_str().eq_ignore_ascii_case("authorization") {
+                            Some(v.to_str().unwrap_or("").to_string())
+                        } else {
+                            None
+                        }
+                    });
+                *captured_auth_clone.lock().unwrap() = auth;
+
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "chatcmpl-auth-openai",
+                    "object": "chat.completion",
+                    "created": 1234567890,
+                    "model": "gpt-4",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+                }))
+            })
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let mut raw_state = build_chat_test_state(&upstream.uri()).await;
+        raw_state.config.providers[0].auth_mode = "pass_authorization".to_string();
+        let state = Arc::new(raw_state);
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "chat-gpt-4",
+                    "input": "auth rewrite openai"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let auth = captured_auth
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("upstream authorization should be present");
+        assert_eq!(auth, "Bearer mw_test_key");
+    }
+
+    /// Verifies downstream Authorization is rewritten for Anthropic-compatible
+    /// upstream as x-api-key when provider auth_mode is pass_authorization.
+    #[tokio::test]
+    async fn auth_header_rewrite_anthropic() {
+        let upstream = MockServer::start().await;
+        let captured_x_api_key = Arc::new(std::sync::Mutex::new(None));
+        let captured_x_api_key_clone = Arc::clone(&captured_x_api_key);
+        let captured_authz = Arc::new(std::sync::Mutex::new(None));
+        let captured_authz_clone = Arc::clone(&captured_authz);
+
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(move |req: &wiremock::Request| {
+                let x_api_key = req.headers.iter().find_map(|(k, v)| {
+                    if k.as_str().eq_ignore_ascii_case("x-api-key") {
+                        Some(v.to_str().unwrap_or("").to_string())
+                    } else {
+                        None
+                    }
+                });
+                let authz = req.headers.iter().find_map(|(k, v)| {
+                    if k.as_str().eq_ignore_ascii_case("authorization") {
+                        Some(v.to_str().unwrap_or("").to_string())
+                    } else {
+                        None
+                    }
+                });
+                *captured_x_api_key_clone.lock().unwrap() = x_api_key;
+                *captured_authz_clone.lock().unwrap() = authz;
+
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "msg-auth-anthropic",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "model": "claude-3-sonnet",
+                    "usage": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4}
+                }))
+            })
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let mut raw_state = build_anthropic_test_state(&upstream.uri()).await;
+        raw_state.config.providers[0].auth_mode = "pass_authorization".to_string();
+        let state = Arc::new(raw_state);
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "anthropic-claude",
+                    "input": "auth rewrite anthropic"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let x_api_key = captured_x_api_key
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("x-api-key should be present");
+        assert_eq!(x_api_key, "mw_test_key");
+        assert!(
+            captured_authz.lock().unwrap().is_none(),
+            "anthropic upstream request should not forward Authorization header"
+        );
+    }
+}
+
+// ============================================================================
+// Test 11: tool_call_roundtrip_chat
+// ============================================================================
+
+mod tool_call_roundtrip_chat_tests {
+    use super::*;
+
+    /// Verifies tool call + function_call_output roundtrip through Chat adapter.
+    #[tokio::test]
+    async fn tool_call_roundtrip_chat() {
+        let upstream = MockServer::start().await;
+        let captured_requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured_requests_clone = Arc::clone(&captured_requests);
+        let call_index = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let call_index_clone = Arc::clone(&call_index);
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                captured_requests_clone.lock().unwrap().push(body);
+                let idx = call_index_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                if idx == 0 {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "chatcmpl_tool_turn_1",
+                        "object": "chat.completion",
+                        "created": 1234567890,
+                        "model": "gpt-4",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": "call_upstream_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "lookup_weather",
+                                        "arguments": "{\"city\":\"Boston\"}"
+                                    }
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
+                        }],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18}
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "chatcmpl_tool_turn_2",
+                        "object": "chat.completion",
+                        "created": 1234567891,
+                        "model": "gpt-4",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "It is sunny in Boston."
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 20, "completion_tokens": 6, "total_tokens": 26}
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(build_chat_test_state(&upstream.uri()).await);
+        let app = build_router(Arc::clone(&state));
+
+        let first_request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "chat-gpt-4",
+                    "input": "What's the weather in Boston?",
+                    "tools": [{
+                        "type": "function",
+                        "name": "lookup_weather",
+                        "description": "Lookup weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"]
+                        }
+                    }]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let first_response = app.clone().oneshot(first_request).await.unwrap();
+        assert_eq!(first_response.status(), axum::http::StatusCode::OK);
+        let first_body = axum::body::to_bytes(first_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        let first_response_id = first_json
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("first response id should be present");
+        let first_output = first_json
+            .get("output")
+            .and_then(|v| v.as_array())
+            .expect("first response output should be array");
+        let tool_call = first_output
+            .iter()
+            .find(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call"))
+            .expect("first response should contain function_call item");
+        let call_id = tool_call
+            .get("call_id")
+            .and_then(|v| v.as_str())
+            .expect("function_call should expose call_id");
+
+        let second_request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "chat-gpt-4",
+                    "previous_response_id": first_response_id,
+                    "input": [{
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": "{\"city\":\"Boston\",\"forecast\":\"sunny\"}"
+                    }]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let second_response = app.oneshot(second_request).await.unwrap();
+        assert_eq!(second_response.status(), axum::http::StatusCode::OK);
+        let second_body = axum::body::to_bytes(second_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+        let second_output = second_json
+            .get("output")
+            .and_then(|v| v.as_array())
+            .expect("second response output should be array");
+        assert!(
+            second_output
+                .iter()
+                .any(|item| item.get("type").and_then(|v| v.as_str()) == Some("message")),
+            "second response should contain assistant message"
+        );
+
+        let captured = captured_requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 2, "two upstream chat requests expected");
+        assert!(
+            captured[0].get("tools").is_some(),
+            "first chat request should carry tool definitions"
+        );
+        assert!(
+            captured[1].get("previous_response_id").is_none(),
+            "chat upstream request must not include previous_response_id"
+        );
+
+        let second_messages = captured[1]
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("second chat request should include messages");
+        assert!(
+            second_messages.iter().any(|message| {
+                message.get("role").and_then(|v| v.as_str()) == Some("tool")
+                    && message
+                        .get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .is_some()
+            }),
+            "second chat request should include mapped tool result message"
+        );
+    }
+}
+
 /// Build a test ServerState with two targets on different providers.
 /// This enables fallback between providers.
 async fn build_state_with_two_targets(first_base_url: &str, second_base_url: &str) -> ServerState {

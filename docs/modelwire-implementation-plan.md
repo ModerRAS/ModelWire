@@ -4482,6 +4482,19 @@ Framework behavior currently in place:
     in these slices and strengthens milestone/public-alpha evidence for
     cross-scope replay and pre-commit reuse-failure fallback behavior.
 
+86. Added direct minimum-slice and milestone traceability coverage in
+    `integration_slices`:
+    `no_fallback_after_sse_commit` now explicitly verifies that once
+    `response.created` is emitted, an upstream parse failure yields downstream
+    `response.failed` without invoking the fallback target; `model_mapping_capture`
+    now explicitly captures mapped upstream model usage while preserving the
+    downstream model alias in the returned response; `auth_header_rewrite_openai`
+    and `auth_header_rewrite_anthropic` now explicitly verify
+    `pass_authorization` header transformation for OpenAI Chat vs Anthropic
+    targets; and `tool_call_roundtrip_chat` now explicitly verifies two-turn
+    Chat tool roundtrip behavior (tools on turn 1, `function_call_output` mapped
+    to tool-role message on turn 2, and no Chat upstream `previous_response_id`).
+
 Next small-model implementation tasks should target these exact seams:
 
 ```text
