@@ -1637,6 +1637,197 @@ mod fallback_429_tests {
             "Response status should be completed"
         );
     }
+
+    /// Verifies route target priority order with three targets.
+    ///
+    /// Target #1 (priority=1) fails with 500, target #2 (priority=2) succeeds,
+    /// target #3 (priority=3) must not be called.
+    #[tokio::test]
+    async fn fallback_tries_three_targets_in_priority_order() {
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        let third = MockServer::start().await;
+
+        let call_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+        let call_order_first = Arc::clone(&call_order);
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(move |_req: &wiremock::Request| {
+                call_order_first.lock().unwrap().push("first".to_string());
+                ResponseTemplate::new(500).set_body_string("first failed")
+            })
+            .expect(1)
+            .mount(&first)
+            .await;
+
+        let call_order_second = Arc::clone(&call_order);
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(move |_req: &wiremock::Request| {
+                call_order_second.lock().unwrap().push("second".to_string());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "resp_second_success",
+                    "model": "gpt-upstream",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_second",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "second target won"
+                        }]
+                    }]
+                }))
+            })
+            .expect(1)
+            .mount(&second)
+            .await;
+
+        let call_order_third = Arc::clone(&call_order);
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(move |_req: &wiremock::Request| {
+                call_order_third.lock().unwrap().push("third".to_string());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "resp_third_should_not_run",
+                    "model": "gpt-upstream",
+                    "output": []
+                }))
+            })
+            .expect(0)
+            .mount(&third)
+            .await;
+
+        let state = Arc::new(
+            build_state_with_three_targets(&first.uri(), &second.uri(), &third.uri()).await,
+        );
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "codex-main",
+                    "input": "priority order"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let order = call_order.lock().unwrap().clone();
+        assert_eq!(order, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    /// Verifies connection error before downstream commit falls back to next target.
+    #[tokio::test]
+    async fn fallback_on_connection_reset_before_commit() {
+        let unreachable_base = "http://127.0.0.1:9";
+        let fallback = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_fallback_after_conn_error",
+                "model": "gpt-upstream",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_conn_fallback",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "fallback after connection error"
+                    }]
+                }]
+            })))
+            .expect(1)
+            .mount(&fallback)
+            .await;
+
+        let state = Arc::new(build_state_with_two_targets(unreachable_base, &fallback.uri()).await);
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "codex-main",
+                    "input": "connection reset fallback"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    /// Verifies malformed streaming payload before first semantic event falls back.
+    #[tokio::test]
+    async fn fallback_on_malformed_stream_before_commit() {
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "event: response.created\n\
+                 data: {invalid_json}\n\n",
+            ))
+            .expect(1)
+            .mount(&first)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "event: response.created\n\
+                 data: {\"response\":{\"id\":\"resp_fallback_stream\",\"model\":\"gpt-upstream\",\"created_at\":1}}\n\n\
+                 event: response.completed\n\
+                 data: {\"response\":{\"id\":\"resp_fallback_stream\",\"output\":[]}}\n\n",
+            ))
+            .expect(1)
+            .mount(&second)
+            .await;
+
+        let state = Arc::new(build_state_with_two_targets(&first.uri(), &second.uri()).await);
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "codex-main",
+                    "input": "malformed stream fallback",
+                    "stream": true
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let sse = String::from_utf8_lossy(&body);
+        assert!(sse.contains("event: response.created"));
+        assert!(sse.contains("event: response.completed"));
+        assert!(sse.contains("resp_fallback_stream"));
+    }
 }
 
 /// Build a test ServerState with two targets on different providers.
@@ -1700,6 +1891,123 @@ async fn build_state_with_two_targets(first_base_url: &str, second_base_url: &st
                     upstream_model: "gpt-fallback".to_string(),
                     wire_api: "responses".to_string(),
                     priority: 2, // Fallback - higher priority tried second
+                    enabled: true,
+                    context_window_tokens: Some(200_000),
+                    max_output_tokens: None,
+                    auto_compact_recommended_tokens: None,
+                    context_safety_margin_tokens: Some(2_000),
+                    token_estimator: None,
+                    context_overflow_policy: "reject".to_string(),
+                    config_json: None,
+                },
+            ],
+        }],
+    };
+
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    db.run_migrations().await.unwrap();
+
+    ServerState {
+        config,
+        db,
+        probe_cache: dashmap::DashMap::new(),
+        probe_locks: dashmap::DashMap::new(),
+        key_limiter_counters: dashmap::DashMap::new(),
+        ip_limiter_counters: dashmap::DashMap::new(),
+        archive_writer: tokio::sync::Mutex::new(None),
+    }
+}
+
+/// Build a test ServerState with three targets across three providers.
+async fn build_state_with_three_targets(
+    first_base_url: &str,
+    second_base_url: &str,
+    third_base_url: &str,
+) -> ServerState {
+    let config = Config {
+        server: ServerConfig {
+            upstream_timeout_secs: 5,
+            ..ServerConfig::default()
+        },
+        security: SecurityConfig::default(),
+        archive: ArchiveConfig::default(),
+        providers: vec![
+            ProviderConfig {
+                id: "provider-1".to_string(),
+                name: "Provider 1".to_string(),
+                base_url: first_base_url.to_string(),
+                auth_mode: "managed".to_string(),
+                default_wire_api: "responses".to_string(),
+                state_scope: Some("scope-1".to_string()),
+                api_key: Some("test-key".to_string()),
+                allow_private_ips: false,
+                skip_ssrf_validation: true,
+                config_json: None,
+            },
+            ProviderConfig {
+                id: "provider-2".to_string(),
+                name: "Provider 2".to_string(),
+                base_url: second_base_url.to_string(),
+                auth_mode: "managed".to_string(),
+                default_wire_api: "responses".to_string(),
+                state_scope: Some("scope-2".to_string()),
+                api_key: Some("test-key".to_string()),
+                allow_private_ips: false,
+                skip_ssrf_validation: true,
+                config_json: None,
+            },
+            ProviderConfig {
+                id: "provider-3".to_string(),
+                name: "Provider 3".to_string(),
+                base_url: third_base_url.to_string(),
+                auth_mode: "managed".to_string(),
+                default_wire_api: "responses".to_string(),
+                state_scope: Some("scope-3".to_string()),
+                api_key: Some("test-key".to_string()),
+                allow_private_ips: false,
+                skip_ssrf_validation: true,
+                config_json: None,
+            },
+        ],
+        routes: vec![RouteConfig {
+            id: Some("triple-route".to_string()),
+            downstream_model: "codex-main".to_string(),
+            description: None,
+            enabled: true,
+            targets: vec![
+                TargetConfig {
+                    provider: "provider-1".to_string(),
+                    upstream_model: "gpt-first".to_string(),
+                    wire_api: "responses".to_string(),
+                    priority: 1,
+                    enabled: true,
+                    context_window_tokens: Some(200_000),
+                    max_output_tokens: None,
+                    auto_compact_recommended_tokens: None,
+                    context_safety_margin_tokens: Some(2_000),
+                    token_estimator: None,
+                    context_overflow_policy: "reject".to_string(),
+                    config_json: None,
+                },
+                TargetConfig {
+                    provider: "provider-2".to_string(),
+                    upstream_model: "gpt-second".to_string(),
+                    wire_api: "responses".to_string(),
+                    priority: 2,
+                    enabled: true,
+                    context_window_tokens: Some(200_000),
+                    max_output_tokens: None,
+                    auto_compact_recommended_tokens: None,
+                    context_safety_margin_tokens: Some(2_000),
+                    token_estimator: None,
+                    context_overflow_policy: "reject".to_string(),
+                    config_json: None,
+                },
+                TargetConfig {
+                    provider: "provider-3".to_string(),
+                    upstream_model: "gpt-third".to_string(),
+                    wire_api: "responses".to_string(),
+                    priority: 3,
                     enabled: true,
                     context_window_tokens: Some(200_000),
                     max_output_tokens: None,

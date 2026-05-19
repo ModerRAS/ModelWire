@@ -4429,6 +4429,14 @@ Framework behavior currently in place:
     verifies unknown model aliases map to `404 model_not_found`, and
     `create_response_upstream_401_returns_normalized_auth_error` verifies
     upstream `401` is normalized to downstream `401 auth_failed`.
+80. Added direct Milestone 6 fallback acceptance slice coverage:
+    `fallback_tries_three_targets_in_priority_order` verifies ordered
+    target-attempt behavior across three targets, 
+    `fallback_on_connection_reset_before_commit` verifies pre-commit transport
+    errors fall back to the next target, and
+    `fallback_on_malformed_stream_before_commit` verifies malformed streaming
+    payloads before first downstream semantic event fall back to the next
+    target.
 
 Next small-model implementation tasks should target these exact seams:
 
