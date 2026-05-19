@@ -4422,6 +4422,13 @@ Framework behavior currently in place:
     unsupported `input_image` / `input_file` blocks return clear downstream
     `400 request_invalid` errors and do not call upstream, covering Milestone
     2 acceptance item 7.
+79. Added missing Milestone 1 boundary acceptance route slices:
+    `create_response_missing_model_returns_400_request_invalid` verifies
+    missing `model` fails fast with downstream `400 request_invalid` and no
+    upstream attempt, `create_response_unknown_model_returns_404_model_not_found`
+    verifies unknown model aliases map to `404 model_not_found`, and
+    `create_response_upstream_401_returns_normalized_auth_error` verifies
+    upstream `401` is normalized to downstream `401 auth_failed`.
 
 Next small-model implementation tasks should target these exact seams:
 

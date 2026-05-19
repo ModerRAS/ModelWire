@@ -346,6 +346,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_response_missing_model_returns_400_request_invalid() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(build_state(&upstream.uri()).await);
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "input": "hello"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let payload: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.error.code.as_deref(), Some("request_invalid"));
+    }
+
+    #[tokio::test]
+    async fn create_response_unknown_model_returns_404_model_not_found() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(build_state(&upstream.uri()).await);
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": "does-not-exist",
+                    "input": "hello"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let payload: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.error.code.as_deref(), Some("model_not_found"));
+    }
+
+    #[tokio::test]
+    async fn create_response_upstream_401_returns_normalized_auth_error() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": {"message": "invalid api key"}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(build_state(&upstream.uri()).await);
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": "codex-main",
+                    "input": "hello"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let payload: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.error.code.as_deref(), Some("auth_failed"));
+    }
+
+    #[tokio::test]
     async fn create_response_rejects_unsupported_image_input_with_clear_400() {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
