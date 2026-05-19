@@ -1119,6 +1119,104 @@ mod anthropic_streaming_tests {
 mod state_scope_reuse_tests {
     use super::*;
 
+    /// Equivalent to minimum-slice `state_scope_optimistic_reuse_success`.
+    #[tokio::test]
+    async fn state_scope_optimistic_reuse_success() {
+        let upstream = MockServer::start().await;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let requests_clone = Arc::clone(&requests);
+        let call_index = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let call_index_clone = Arc::clone(&call_index);
+
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                requests_clone.lock().unwrap().push(body);
+                let idx = call_index_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                if idx == 0 {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "resp_upstream_state_scope_success_1",
+                        "model": "gpt-4",
+                        "output": [{
+                            "type": "message",
+                            "id": "msg_state_scope_success_1",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "first"}]
+                        }],
+                        "usage": {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14}
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "resp_upstream_state_scope_success_2",
+                        "model": "gpt-4",
+                        "output": [{
+                            "type": "message",
+                            "id": "msg_state_scope_success_2",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "second"}]
+                        }],
+                        "usage": {"input_tokens": 15, "output_tokens": 5, "total_tokens": 20}
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(build_state_scope_test_state(&upstream.uri()).await);
+        let app = build_router(Arc::clone(&state));
+
+        let first_request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "codex-main",
+                    "input": "first"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let first_response = app.clone().oneshot(first_request).await.unwrap();
+        assert_eq!(first_response.status(), axum::http::StatusCode::OK);
+        let first_body = axum::body::to_bytes(first_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        let first_response_id = first_json
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("first response id should be present");
+
+        let second_request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "codex-main",
+                    "input": "second",
+                    "previous_response_id": first_response_id
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let second_response = app.oneshot(second_request).await.unwrap();
+        assert_eq!(second_response.status(), axum::http::StatusCode::OK);
+
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 2, "two upstream requests expected");
+        assert!(
+            captured[1].get("previous_response_id").is_some(),
+            "second upstream request should optimistically reuse previous_response_id"
+        );
+    }
+
     /// State scope reuse - second request with previous_response_id reuses upstream handle.
     ///
     /// Setup: Two requests to same provider with same state_scope
@@ -1956,6 +2054,166 @@ mod fallback_429_tests {
 mod no_fallback_after_commit_tests {
     use super::*;
 
+    /// Equivalent to minimum-slice `codex_context_overflow_before_upstream`.
+    #[tokio::test]
+    async fn codex_context_overflow_before_upstream() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(build_test_state(&upstream.uri()).await);
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "codex-main",
+                    "input": "x".repeat(1_200_000),
+                    "max_output_tokens": 20000
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let payload: modelwire_core::error::ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload.error.code.as_deref(),
+            Some("context_length_exceeded"),
+            "overflow should be rejected before upstream call"
+        );
+    }
+
+    /// Equivalent to minimum-slice `responses_stream_text_basic`.
+    #[tokio::test]
+    async fn responses_stream_text_basic() {
+        let upstream = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "event: response.created\n\
+                 data: {\"response\":{\"id\":\"resp_stream_basic\",\"model\":\"gpt-upstream\",\"created_at\":1}}\n\n\
+                 event: response.output_item.added\n\
+                 data: {\"response_id\":\"resp_stream_basic\",\"item\":{\"type\":\"message\",\"id\":\"msg_stream_basic\",\"role\":\"assistant\",\"content\":[]}}\n\n\
+                 event: response.text.delta\n\
+                 data: {\"item_id\":\"msg_stream_basic\",\"delta\":{\"text\":\"hello\"}}\n\n\
+                 event: response.completed\n\
+                 data: {\"response\":{\"id\":\"resp_stream_basic\",\"output\":[]}}\n\n",
+            ))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(build_test_state(&upstream.uri()).await);
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "codex-main",
+                    "input": "stream basic",
+                    "stream": true
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let sse = String::from_utf8_lossy(&body);
+        assert!(sse.contains("event: response.created"));
+        assert!(sse.contains("event: response.text.delta"));
+        assert!(sse.contains("event: response.completed"));
+    }
+
+    /// Equivalent to minimum-slice `chat_stream_text_basic`.
+    #[tokio::test]
+    async fn chat_stream_text_basic() {
+        let upstream = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "event: delta\n\
+                 data: {\"id\":\"chatcmpl_stream_basic\",\"delta\":{\"content\":\"Hello\"},\"index\":0}\n\n\
+                 event: delta\n\
+                 data: {\"id\":\"chatcmpl_stream_basic\",\"delta\":{\"content\":\" world\"},\"index\":0}\n\n\
+                 event: [DONE]\n\
+                 data: \n\n",
+            ))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(build_chat_test_state(&upstream.uri()).await);
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "chat-gpt-4",
+                    "input": "stream chat basic",
+                    "stream": true
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let sse = String::from_utf8_lossy(&body);
+        assert!(
+            sse.contains("event: response.text.delta")
+                || sse.contains("Hello")
+                || sse.contains("world"),
+            "chat stream should map upstream deltas into downstream text stream"
+        );
+    }
+
     /// Verifies that once streaming is committed (response.created emitted),
     /// upstream failure does not trigger fallback to the next target.
     #[tokio::test]
@@ -2036,6 +2294,79 @@ mod no_fallback_after_commit_tests {
 mod model_mapping_capture_tests {
     use super::*;
 
+    /// Equivalent to minimum-slice `responses_text_basic`.
+    #[tokio::test]
+    async fn responses_text_basic() {
+        let upstream = MockServer::start().await;
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                *captured_clone.lock().unwrap() = Some(body);
+
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "resp_upstream_responses_text_basic",
+                    "model": "gpt-upstream",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_upstream_responses_text_basic",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hello from responses"}]
+                    }],
+                    "usage": {"input_tokens": 5, "output_tokens": 4, "total_tokens": 9}
+                }))
+            })
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(build_test_state(&upstream.uri()).await);
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "codex-main",
+                    "input": "say hello"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let response_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            response_json.get("object").and_then(|v| v.as_str()),
+            Some("response")
+        );
+        assert_eq!(
+            response_json.get("model").and_then(|v| v.as_str()),
+            Some("codex-main")
+        );
+
+        let upstream_body = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("upstream request should be captured");
+        assert_eq!(
+            upstream_body.get("model").and_then(|v| v.as_str()),
+            Some("gpt-upstream")
+        );
+    }
+
     /// Verifies downstream model alias maps to configured upstream model and
     /// upstream request captures mapped model value.
     #[tokio::test]
@@ -2114,6 +2445,80 @@ mod model_mapping_capture_tests {
 
 mod auth_header_rewrite_tests {
     use super::*;
+
+    /// Equivalent to minimum-slice `chat_text_basic`.
+    #[tokio::test]
+    async fn chat_text_basic() {
+        let upstream = MockServer::start().await;
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                *captured_clone.lock().unwrap() = Some(body);
+
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "chatcmpl_chat_text_basic",
+                    "object": "chat.completion",
+                    "created": 1234567890,
+                    "model": "gpt-4",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hello from chat"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 4, "total_tokens": 9}
+                }))
+            })
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(build_chat_test_state(&upstream.uri()).await);
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "chat-gpt-4",
+                    "input": "say hello"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let response_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            response_json.get("model").and_then(|v| v.as_str()),
+            Some("chat-gpt-4")
+        );
+
+        let upstream_body = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("upstream request should be captured");
+        assert_eq!(
+            upstream_body.get("model").and_then(|v| v.as_str()),
+            Some("gpt-4")
+        );
+        assert!(
+            upstream_body.get("messages").is_some(),
+            "chat upstream request should include messages"
+        );
+    }
 
     /// Verifies downstream Authorization is passed to OpenAI-compatible upstream
     /// as Authorization when provider auth_mode is pass_authorization.
@@ -2269,6 +2674,144 @@ mod auth_header_rewrite_tests {
 
 mod tool_call_roundtrip_chat_tests {
     use super::*;
+
+    /// Equivalent to minimum-slice `tool_call_roundtrip_responses`.
+    /// This validates native Responses tool call + tool result continuation.
+    #[tokio::test]
+    async fn tool_call_roundtrip_responses() {
+        let upstream = MockServer::start().await;
+        let captured_requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured_requests_clone = Arc::clone(&captured_requests);
+        let call_index = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let call_index_clone = Arc::clone(&call_index);
+
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                captured_requests_clone.lock().unwrap().push(body);
+                let idx = call_index_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                if idx == 0 {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "resp_upstream_tool_roundtrip_1",
+                        "model": "gpt-upstream",
+                        "output": [{
+                            "type": "function_call",
+                            "id": "fc_upstream_1",
+                            "call_id": "call_upstream_1",
+                            "name": "lookup_weather",
+                            "arguments": "{\"city\":\"Boston\"}"
+                        }],
+                        "usage": {"input_tokens": 10, "output_tokens": 8, "total_tokens": 18}
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "resp_upstream_tool_roundtrip_2",
+                        "model": "gpt-upstream",
+                        "output": [{
+                            "type": "message",
+                            "id": "msg_upstream_tool_roundtrip_2",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Sunny in Boston"}]
+                        }],
+                        "usage": {"input_tokens": 20, "output_tokens": 6, "total_tokens": 26}
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(build_test_state(&upstream.uri()).await);
+        let app = build_router(Arc::clone(&state));
+
+        let first_request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "codex-main",
+                    "input": "weather in boston?",
+                    "tools": [{
+                        "type": "function",
+                        "name": "lookup_weather",
+                        "description": "Lookup weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"]
+                        }
+                    }]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let first_response = app.clone().oneshot(first_request).await.unwrap();
+        assert_eq!(first_response.status(), axum::http::StatusCode::OK);
+        let first_body = axum::body::to_bytes(first_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        let first_response_id = first_json
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("first response id should be present");
+        let first_output = first_json
+            .get("output")
+            .and_then(|v| v.as_array())
+            .expect("first response output should be array");
+        let tool_call = first_output
+            .iter()
+            .find(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call"))
+            .expect("first response should contain function_call");
+        let call_id = tool_call
+            .get("call_id")
+            .and_then(|v| v.as_str())
+            .expect("function_call should expose call_id");
+
+        let second_request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "codex-main",
+                    "previous_response_id": first_response_id,
+                    "input": [{
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": "{\"city\":\"Boston\",\"forecast\":\"sunny\"}"
+                    }]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let second_response = app.oneshot(second_request).await.unwrap();
+        assert_eq!(second_response.status(), axum::http::StatusCode::OK);
+
+        let captured = captured_requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 2, "two upstream responses requests expected");
+        assert!(
+            captured[0].get("tools").is_some(),
+            "first upstream request should include tools"
+        );
+        let second_input = captured[1]
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("second upstream request should include input array");
+        assert!(
+            second_input.iter().any(|item| {
+                item.get("type").and_then(|v| v.as_str()) == Some("function_call_output")
+            }),
+            "second upstream request should include function_call_output"
+        );
+    }
 
     /// Verifies tool call + function_call_output roundtrip through Chat adapter.
     #[tokio::test]
@@ -3291,6 +3834,204 @@ mod restart_tests {
 
 mod state_scope_reuse_failure_tests {
     use super::*;
+
+    /// Equivalent to minimum-slice `previous_response_cross_upstream_replay`.
+    #[tokio::test]
+    async fn previous_response_cross_upstream_replay() {
+        let upstream_a = MockServer::start().await;
+        let upstream_b = MockServer::start().await;
+        let captured_b = Arc::new(std::sync::Mutex::new(None));
+        let captured_b_clone = Arc::clone(&captured_b);
+
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(move |_req: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "resp_upstream_cross_replay_1",
+                    "model": "gpt-a",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_upstream_cross_replay_1",
+                        "role": "assistant",
+                        "content": [{"type":"output_text","text":"from provider a"}]
+                    }],
+                    "usage": {"input_tokens": 8, "output_tokens": 3, "total_tokens": 11}
+                }))
+            })
+            .expect(1)
+            .mount(&upstream_a)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                *captured_b_clone.lock().unwrap() = Some(body);
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "resp_upstream_cross_replay_2",
+                    "model": "gpt-b",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_upstream_cross_replay_2",
+                        "role": "assistant",
+                        "content": [{"type":"output_text","text":"from provider b"}]
+                    }],
+                    "usage": {"input_tokens": 14, "output_tokens": 4, "total_tokens": 18}
+                }))
+            })
+            .expect(1)
+            .mount(&upstream_b)
+            .await;
+
+        let config = Config {
+            server: ServerConfig {
+                upstream_timeout_secs: 5,
+                ..ServerConfig::default()
+            },
+            security: SecurityConfig::default(),
+            archive: ArchiveConfig::default(),
+            providers: vec![
+                ProviderConfig {
+                    id: "provider-a".to_string(),
+                    name: "Provider A".to_string(),
+                    base_url: upstream_a.uri(),
+                    auth_mode: "managed".to_string(),
+                    default_wire_api: "responses".to_string(),
+                    state_scope: Some("scope-a".to_string()),
+                    api_key: Some("k1".to_string()),
+                    allow_private_ips: false,
+                    skip_ssrf_validation: true,
+                    config_json: None,
+                },
+                ProviderConfig {
+                    id: "provider-b".to_string(),
+                    name: "Provider B".to_string(),
+                    base_url: upstream_b.uri(),
+                    auth_mode: "managed".to_string(),
+                    default_wire_api: "responses".to_string(),
+                    state_scope: Some("scope-b".to_string()),
+                    api_key: Some("k1".to_string()),
+                    allow_private_ips: false,
+                    skip_ssrf_validation: true,
+                    config_json: None,
+                },
+            ],
+            routes: vec![
+                RouteConfig {
+                    id: Some("route-a".to_string()),
+                    downstream_model: "model-a".to_string(),
+                    description: None,
+                    enabled: true,
+                    targets: vec![TargetConfig {
+                        provider: "provider-a".to_string(),
+                        upstream_model: "gpt-a".to_string(),
+                        wire_api: "responses".to_string(),
+                        priority: 10,
+                        enabled: true,
+                        context_window_tokens: Some(200_000),
+                        max_output_tokens: None,
+                        auto_compact_recommended_tokens: None,
+                        context_safety_margin_tokens: Some(2_000),
+                        token_estimator: None,
+                        context_overflow_policy: "reject".to_string(),
+                        config_json: None,
+                    }],
+                },
+                RouteConfig {
+                    id: Some("route-b".to_string()),
+                    downstream_model: "model-b".to_string(),
+                    description: None,
+                    enabled: true,
+                    targets: vec![TargetConfig {
+                        provider: "provider-b".to_string(),
+                        upstream_model: "gpt-b".to_string(),
+                        wire_api: "responses".to_string(),
+                        priority: 10,
+                        enabled: true,
+                        context_window_tokens: Some(200_000),
+                        max_output_tokens: None,
+                        auto_compact_recommended_tokens: None,
+                        context_safety_margin_tokens: Some(2_000),
+                        token_estimator: None,
+                        context_overflow_policy: "reject".to_string(),
+                        config_json: None,
+                    }],
+                },
+            ],
+        };
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = Arc::new(ServerState {
+            config,
+            db,
+            probe_cache: dashmap::DashMap::new(),
+            probe_locks: dashmap::DashMap::new(),
+            key_limiter_counters: dashmap::DashMap::new(),
+            ip_limiter_counters: dashmap::DashMap::new(),
+            archive_writer: tokio::sync::Mutex::new(None),
+        });
+        let app = build_router(Arc::clone(&state));
+
+        let first_request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "model-a",
+                    "input": "first"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let first_response = app.clone().oneshot(first_request).await.unwrap();
+        assert_eq!(first_response.status(), axum::http::StatusCode::OK);
+        let first_body = axum::body::to_bytes(first_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        let first_response_id = first_json
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("first response id should be present");
+
+        let second_request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "model-b",
+                    "input": "second",
+                    "previous_response_id": first_response_id
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let second_response = app.oneshot(second_request).await.unwrap();
+        assert_eq!(second_response.status(), axum::http::StatusCode::OK);
+
+        let captured = captured_b
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("second upstream request should be captured");
+        assert!(
+            captured.get("previous_response_id").is_none(),
+            "cross-upstream replay should not forward raw previous_response_id"
+        );
+        let input = captured
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("replay should include input array");
+        assert!(
+            input.len() >= 2,
+            "replay should include prior visible history plus new turn"
+        );
+    }
 
     /// Verifies that when cross-upstream state_scope reuse fails, replay is attempted.
     ///

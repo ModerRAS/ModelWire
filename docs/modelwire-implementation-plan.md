@@ -4495,6 +4495,16 @@ Framework behavior currently in place:
     Chat tool roundtrip behavior (tools on turn 1, `function_call_output` mapped
     to tool-role message on turn 2, and no Chat upstream `previous_response_id`).
 
+87. Completed remaining minimum-slice naming gaps with executable behavior
+    tests and direct name alignment:
+    added explicit tests `codex_context_overflow_before_upstream`,
+    `state_scope_optimistic_reuse_success`, and
+    `previous_response_cross_upstream_replay`; renamed relay slice tests to the
+    exact minimum-slice names `previous_response_same_upstream`,
+    `archive_visible_only_lineage`, `archive_off_writes_nothing`, and
+    `context_guard_rejects_before_upstream`; and re-validated the aligned
+    slices with targeted runtime executions.
+
 Next small-model implementation tasks should target these exact seams:
 
 ```text

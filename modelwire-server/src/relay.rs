@@ -4124,7 +4124,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn previous_response_same_target_uses_upstream_handle() {
+    async fn previous_response_same_upstream() {
         let mock = MockServer::start().await;
         let previous_upstream = "resp_upstream_prev";
         let current_upstream = "resp_upstream_curr";
@@ -4263,7 +4263,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_guard_rejects_before_upstream_call() {
+    async fn context_guard_rejects_before_upstream() {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/responses"))
@@ -4748,7 +4748,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn archive_capture_mode_off_writes_no_archive_files() {
+    async fn archive_off_writes_nothing() {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/responses"))
@@ -4805,7 +4805,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn archive_capture_visible_only_writes_redacted_visible_record() {
+    async fn archive_visible_only_lineage() {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/responses"))
