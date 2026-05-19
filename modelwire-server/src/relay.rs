@@ -59,6 +59,7 @@ struct NonStreamingAttemptContext<'a> {
     continuation: Option<&'a ContinuationContext>,
     archive_capture_mode_override: Option<&'a str>,
     routing_attempts: &'a mut Vec<RoutingAttempt>,
+    downstream_key_hash: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -193,6 +194,7 @@ pub async fn relay_non_streaming_response(
         downstream_authorization,
         None,
         None,
+        None,
     )
     .await
 }
@@ -203,6 +205,7 @@ pub async fn relay_non_streaming_response_scoped(
     request_id: String,
     raw_json: serde_json::Value,
     downstream_authorization: Option<String>,
+    downstream_key_hash: Option<String>,
     allowed_providers: Option<Vec<String>>,
     archive_capture_mode_override: Option<String>,
 ) -> Result<DownstreamResponse, Error> {
@@ -307,6 +310,7 @@ pub async fn relay_non_streaming_response_scoped(
                 continuation: continuation.as_ref(),
                 archive_capture_mode_override: archive_capture_mode_override.as_deref(),
                 routing_attempts: &mut routing_attempts,
+                downstream_key_hash: downstream_key_hash.as_deref(),
             },
         )
         .await
@@ -735,7 +739,7 @@ async fn try_target(
             let _ = store_log(
                 &state.db,
                 &canonical.request_id,
-                None,
+                attempt_context.downstream_key_hash,
                 Some(&route.downstream_model),
                 Some(&route.route_id),
                 Some(&target.target_id),
@@ -769,7 +773,7 @@ async fn try_target(
             let _ = store_log(
                 &state.db,
                 &canonical.request_id,
-                None,
+                attempt_context.downstream_key_hash,
                 Some(&route.downstream_model),
                 Some(&route.route_id),
                 Some(&target.target_id),
@@ -824,7 +828,7 @@ async fn try_target(
                 let _ = store_log(
                     &state.db,
                     &canonical.request_id,
-                    None,
+                    attempt_context.downstream_key_hash,
                     Some(&route.downstream_model),
                     Some(&route.route_id),
                     Some(&target.target_id),
@@ -857,7 +861,7 @@ async fn try_target(
                 let _ = store_log(
                     &state.db,
                     &canonical.request_id,
-                    None,
+                    attempt_context.downstream_key_hash,
                     Some(&route.downstream_model),
                     Some(&route.route_id),
                     Some(&target.target_id),
@@ -890,7 +894,7 @@ async fn try_target(
         let _ = store_log(
             &state.db,
             &canonical.request_id,
-            None,
+            attempt_context.downstream_key_hash,
             Some(&route.downstream_model),
             Some(&route.route_id),
             Some(&target.target_id),
@@ -922,7 +926,7 @@ async fn try_target(
             let _ = store_log(
                 &state.db,
                 &canonical.request_id,
-                None,
+                attempt_context.downstream_key_hash,
                 Some(&route.downstream_model),
                 Some(&route.route_id),
                 Some(&target.target_id),
@@ -968,7 +972,7 @@ async fn try_target(
     let _ = store_log(
         &state.db,
         &canonical.request_id,
-        None, // downstream_key_hash - not available in relay
+        attempt_context.downstream_key_hash,
         Some(&route.downstream_model),
         Some(&route.route_id),
         Some(&target.target_id),
@@ -3789,6 +3793,7 @@ mod tests {
             Some("Bearer mw_key".to_string()),
             None,
             None,
+            None,
         )
         .await
         .expect("second target should satisfy tool-bearing request");
@@ -5098,6 +5103,7 @@ mod tests {
             "req_archive_override".to_string(),
             request,
             Some("Bearer mw_k1".to_string()),
+            None,
             None,
             Some("metadata_only".to_string()),
         )

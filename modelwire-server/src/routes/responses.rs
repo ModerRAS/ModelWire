@@ -89,6 +89,7 @@ pub async fn create_response(
     let archive_capture_mode_override = auth_context
         .as_ref()
         .and_then(|ctx| ctx.archive_capture_mode.clone());
+    let downstream_key_hash = auth_context.as_ref().and_then(|ctx| ctx.key_hash.clone());
 
     if stream {
         match relay_streaming_response_scoped(
@@ -124,6 +125,7 @@ pub async fn create_response(
             request_id,
             raw_json,
             downstream_authorization,
+            downstream_key_hash,
             allowed_providers,
             archive_capture_mode_override,
         )

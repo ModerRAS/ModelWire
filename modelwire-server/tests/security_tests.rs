@@ -2122,6 +2122,73 @@ mod admin_security {
     }
 
     #[tokio::test]
+    async fn request_logs_store_hashed_downstream_key_not_raw_key() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_logs_hashed_key",
+                "model": "test-model",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_logs_hashed_key",
+                    "role": "assistant",
+                    "content": [{"type":"output_text","text":"ok"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let mut state = build_public_state().await;
+        state.config.providers[0].base_url = upstream.uri();
+        let log_secret = state
+            .config
+            .security
+            .log_secret
+            .clone()
+            .expect("test state should have log secret");
+        let state = Arc::new(state);
+        let app = build_router(Arc::clone(&state));
+
+        let raw_key = "mw_test_key";
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", format!("Bearer {raw_key}"))
+            .header("x-request-id", "req_logs_hashed_key")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"test-model","input":"hello"}"#))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let expected_hash = modelwire_core::hash_key_for_logging(raw_key, &log_secret);
+        let logs = modelwire_db::repo::logs::list_logs(&state.db, 50)
+            .await
+            .expect("list logs should succeed");
+        let row = logs
+            .into_iter()
+            .find(|entry| {
+                entry.request_id == "req_logs_hashed_key"
+                    && entry.provider_id.as_deref() == Some("provider-a")
+            })
+            .expect("expected persisted request log row for request");
+
+        assert_eq!(
+            row.downstream_key_hash.as_deref(),
+            Some(expected_hash.as_str()),
+            "request logs must persist hashed downstream key"
+        );
+        let serialized = format!("{row:?}");
+        assert!(
+            !serialized.contains(raw_key),
+            "request log serialization must not contain raw key material"
+        );
+    }
+
+    #[tokio::test]
     async fn running_request_keeps_route_snapshot_when_admin_edits_route() {
         let first = MockServer::start().await;
         let second = MockServer::start().await;
