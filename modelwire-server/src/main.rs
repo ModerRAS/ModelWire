@@ -33,27 +33,6 @@ enum Commands {
     Migrate,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cli_accepts_config_before_serve_subcommand() {
-        let args = Args::try_parse_from(["modelwire", "--config", "modelwire.toml", "serve"])
-            .expect("CLI should accept config before serve subcommand");
-        assert_eq!(args.config, "modelwire.toml");
-        assert!(matches!(args.command, Some(Commands::Serve)));
-    }
-
-    #[test]
-    fn cli_defaults_to_modelwire_toml() {
-        let args = Args::try_parse_from(["modelwire", "serve"])
-            .expect("CLI should parse serve with default config");
-        assert_eq!(args.config, "modelwire.toml");
-        assert!(matches!(args.command, Some(Commands::Serve)));
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
@@ -166,4 +145,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_accepts_config_before_serve_subcommand() {
+        let args = Args::try_parse_from(["modelwire", "--config", "modelwire.toml", "serve"])
+            .expect("CLI should accept config before serve subcommand");
+        assert_eq!(args.config, "modelwire.toml");
+        assert!(matches!(args.command, Some(Commands::Serve)));
+    }
+
+    #[test]
+    fn cli_defaults_to_modelwire_toml() {
+        let args = Args::try_parse_from(["modelwire", "serve"])
+            .expect("CLI should parse serve with default config");
+        assert_eq!(args.config, "modelwire.toml");
+        assert!(matches!(args.command, Some(Commands::Serve)));
+    }
 }

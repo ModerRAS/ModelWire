@@ -346,6 +346,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_response_rejects_unsupported_image_input_with_clear_400() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(build_state(&upstream.uri()).await);
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": "codex-main",
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_image",
+                            "image_url": "https://example.test/a.png"
+                        }]
+                    }]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let payload: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.error.code.as_deref(), Some("request_invalid"));
+        assert!(
+            payload
+                .error
+                .message
+                .contains("Unsupported content block type 'input_image'"),
+            "Expected clear unsupported-image error, got: {}",
+            payload.error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn create_response_rejects_unsupported_file_input_with_clear_400() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(build_state(&upstream.uri()).await);
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": "codex-main",
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_file",
+                            "file_id": "file_abc123"
+                        }]
+                    }]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let payload: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.error.code.as_deref(), Some("request_invalid"));
+        assert!(
+            payload
+                .error
+                .message
+                .contains("Unsupported content block type 'input_file'"),
+            "Expected clear unsupported-file error, got: {}",
+            payload.error.message
+        );
+    }
+
+    #[tokio::test]
     async fn create_response_stream_returns_sse_payload() {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))

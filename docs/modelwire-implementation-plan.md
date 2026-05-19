@@ -4412,6 +4412,16 @@ Framework behavior currently in place:
     `provider_url_rejects_metadata_ip_by_default`,
     `provider_url_allows_private_ip_with_explicit_allow_flag`, and
     `upstream_redirect_to_private_ip_rejected`.
+78. Closed Milestone 0 clippy acceptance and added explicit unsupported
+    image/file input route-slice coverage:
+    `modelwire-server/src/main.rs` test module order now satisfies
+    `cargo clippy --workspace --all-targets -- -D warnings`, and
+    route-level slices
+    `create_response_rejects_unsupported_image_input_with_clear_400` plus
+    `create_response_rejects_unsupported_file_input_with_clear_400` now verify
+    unsupported `input_image` / `input_file` blocks return clear downstream
+    `400 request_invalid` errors and do not call upstream, covering Milestone
+    2 acceptance item 7.
 
 Next small-model implementation tasks should target these exact seams:
 
