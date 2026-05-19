@@ -4450,6 +4450,13 @@ Framework behavior currently in place:
     redacted consistently; security tests
     `redact_json_handles_nested_objects` and `redact_json_handles_arrays` now
     assert strict nested redaction behavior instead of documenting a known gap.
+83. Enforced parameterized SQLite janitor SQL for response-chain cleanup paths:
+    janitor SQLite `IN (...)` deletes/lookups for response IDs now use dynamic
+    placeholders plus bound parameters (no quoted-ID string concatenation),
+    aligning with section 28.1.8 "Use parameterized SQL only"; runtime coverage
+    `janitor_sqlite_parameterized_ids_handle_quotes_safely` verifies expired
+    IDs containing quote characters are deleted safely while unrelated rows
+    remain intact.
 
 Next small-model implementation tasks should target these exact seams:
 

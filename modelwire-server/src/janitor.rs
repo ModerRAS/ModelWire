@@ -47,6 +47,36 @@ pub struct Janitor {
 }
 
 impl Janitor {
+    /// Build a SQLite placeholder list like "?,?,?" for `IN` clauses.
+    fn sqlite_in_placeholders(count: usize) -> String {
+        std::iter::repeat("?")
+            .take(count)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Delete rows from a SQLite table using a fully parameterized `IN` clause.
+    async fn sqlite_delete_by_ids(
+        pool: &sqlx::SqlitePool,
+        table: &str,
+        column: &str,
+        ids: &[String],
+    ) -> Result<u64, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let placeholders = Self::sqlite_in_placeholders(ids.len());
+        let sql = format!("DELETE FROM {table} WHERE {column} IN ({placeholders})");
+        let mut query = sqlx::query(&sql);
+        for id in ids {
+            query = query.bind(id);
+        }
+
+        let result = query.execute(pool).await?;
+        Ok(result.rows_affected())
+    }
+
     /// Create a new janitor with default TTLs.
     pub fn new(db: DbPool) -> Self {
         Self {
@@ -207,48 +237,38 @@ impl Janitor {
 
         match &self.db {
             DbPool::Sqlite(pool) => {
-                // Format IDs as quoted strings for SQLite IN clause
-                let ids_list = expired_responses
-                    .iter()
-                    .map(|s| format!("'{s}'"))
-                    .collect::<Vec<_>>()
-                    .join(",");
-
-                // Handle empty list case
-                if ids_list.is_empty() {
-                    return Ok((0, 0, 0));
-                }
-
                 // Count and delete response items (directly by response_id)
-                let items_result = sqlx::query(&format!(
-                    "DELETE FROM response_items WHERE response_id IN ({ids_list})",
-                ))
-                .execute(pool)
+                let items_result = Self::sqlite_delete_by_ids(
+                    pool,
+                    "response_items",
+                    "response_id",
+                    &expired_responses,
+                )
                 .await;
 
                 if let Ok(r) = items_result {
-                    response_items_deleted = r.rows_affected();
+                    response_items_deleted = r;
                 }
 
                 // Delete upstream handles (directly by modelwire_response_id)
-                let handles_result = sqlx::query(&format!(
-                    "DELETE FROM upstream_handles WHERE modelwire_response_id IN ({ids_list})",
-                ))
-                .execute(pool)
+                let handles_result = Self::sqlite_delete_by_ids(
+                    pool,
+                    "upstream_handles",
+                    "modelwire_response_id",
+                    &expired_responses,
+                )
                 .await;
 
                 if let Ok(r) = handles_result {
-                    handles_deleted = r.rows_affected();
+                    handles_deleted = r;
                 }
 
                 // Delete response records
                 let responses_result =
-                    sqlx::query(&format!("DELETE FROM responses WHERE id IN ({ids_list})"))
-                        .execute(pool)
-                        .await;
+                    Self::sqlite_delete_by_ids(pool, "responses", "id", &expired_responses).await;
 
                 if let Ok(r) = responses_result {
-                    responses_deleted = r.rows_affected();
+                    responses_deleted = r;
                 }
             }
             DbPool::Postgres(pool) => {
@@ -329,27 +349,19 @@ impl Janitor {
                 }
 
                 let expired_ids: Vec<String> = expired.iter().map(|r| r.id.clone()).collect();
-                let ids_list = expired_ids
-                    .iter()
-                    .map(|s| format!("'{s}'"))
-                    .collect::<Vec<_>>()
-                    .join(",");
-
-                // Handle empty list case
-                if ids_list.is_empty() {
-                    return Ok(Vec::new());
-                }
+                let placeholders = Self::sqlite_in_placeholders(expired_ids.len());
 
                 // Find all responses that reference any expired response
                 // We need to check if these referencing responses themselves are non-expired
-                let referencing_responses: Vec<ReferencingResponse> = sqlx::query_as(
-                    &format!(
-                        "SELECT id, previous_response_id FROM responses WHERE previous_response_id IN ({ids_list})",
-                    ),
-                )
-                .fetch_all(pool)
-                .await
-                .unwrap_or_default();
+                let sql = format!(
+                    "SELECT id, previous_response_id FROM responses WHERE previous_response_id IN ({placeholders})",
+                );
+                let mut query = sqlx::query_as::<_, ReferencingResponse>(&sql);
+                for id in &expired_ids {
+                    query = query.bind(id);
+                }
+                let referencing_responses: Vec<ReferencingResponse> =
+                    query.fetch_all(pool).await.unwrap_or_default();
 
                 // Collect IDs of expired responses that ARE referenced by non-expired responses
                 let mut referenced_ids: std::collections::HashSet<String> =
@@ -812,6 +824,97 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(count.0, 2, "Both non-expired responses should still exist");
+            }
+            DbPool::Postgres(_) => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn janitor_sqlite_parameterized_ids_handle_quotes_safely() {
+        let db = DbPool::connect("sqlite::memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+
+        let janitor = Janitor::with_ttls(
+            db.clone(),
+            Duration::from_secs(3600), // 1 hour
+            Duration::from_secs(86400),
+            Duration::from_secs(86400),
+        );
+
+        let two_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        let now = chrono::Utc::now().to_rfc3339();
+        let quoted_id = "resp_with_quote_'_and_tokens";
+
+        match &db {
+            DbPool::Sqlite(pool) => {
+                // Expired response with quote characters in ID should still be deleted safely.
+                sqlx::query(
+                    "INSERT INTO responses (id, request_id, downstream_model, status, created_at, completed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                )
+                .bind(quoted_id)
+                .bind("req_quoted")
+                .bind("test-model")
+                .bind("completed")
+                .bind(&two_hours_ago)
+                .bind(&two_hours_ago)
+                .execute(pool)
+                .await
+                .unwrap();
+
+                sqlx::query(
+                    "INSERT INTO response_items (id, response_id, sequence, item_type, content_json, visible, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind("item_quoted")
+                .bind(quoted_id)
+                .bind(0)
+                .bind("message")
+                .bind(r#"{"text":"safe"}"#)
+                .bind(1)
+                .bind(&two_hours_ago)
+                .execute(pool)
+                .await
+                .unwrap();
+
+                // Control response should remain untouched.
+                sqlx::query(
+                    "INSERT INTO responses (id, request_id, downstream_model, status, created_at, completed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                )
+                .bind("recent_control")
+                .bind("req_control")
+                .bind("test-model")
+                .bind("completed")
+                .bind(&now)
+                .bind(&now)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            DbPool::Postgres(_) => unreachable!(),
+        }
+
+        let report = janitor.run_cleanup().await.unwrap();
+        assert_eq!(report.responses_deleted, 1);
+        assert_eq!(report.response_items_deleted, 1);
+
+        match &db {
+            DbPool::Sqlite(pool) => {
+                let quoted_exists: (i64,) =
+                    sqlx::query_as("SELECT COUNT(*) FROM responses WHERE id = ?")
+                        .bind(quoted_id)
+                        .fetch_one(pool)
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    quoted_exists.0, 0,
+                    "Quoted expired response should be deleted"
+                );
+
+                let control_exists: (i64,) =
+                    sqlx::query_as("SELECT COUNT(*) FROM responses WHERE id = 'recent_control'")
+                        .fetch_one(pool)
+                        .await
+                        .unwrap();
+                assert_eq!(control_exists.0, 1, "Recent control response should remain");
             }
             DbPool::Postgres(_) => unreachable!(),
         }
