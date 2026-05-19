@@ -4437,6 +4437,13 @@ Framework behavior currently in place:
     `fallback_on_malformed_stream_before_commit` verifies malformed streaming
     payloads before first downstream semantic event fall back to the next
     target.
+81. Added explicit Milestone 1 operational-state acceptance slice for
+    upstream-handle privacy + persistence:
+    `create_response_keeps_upstream_id_private_but_persists_operational_metadata`
+    now verifies the downstream response body does not expose upstream-private
+    response IDs while operational DB rows (`responses` and `upstream_handles`)
+    persist provider/upstream metadata and the upstream response handle for
+    continuation.
 
 Next small-model implementation tasks should target these exact seams:
 

@@ -299,7 +299,9 @@ mod tests {
         ArchiveConfig, Config, ProviderConfig, RouteConfig, SecurityConfig, ServerConfig,
         TargetConfig,
     };
-    use modelwire_db::repo::responses::{store_response_metadata, ResponseInsert};
+    use modelwire_db::repo::responses::{
+        get_latest_upstream_handle, get_response, store_response_metadata, ResponseInsert,
+    };
     use modelwire_db::Database;
     use std::sync::Arc;
     use tower::util::ServiceExt;
@@ -558,6 +560,93 @@ mod tests {
                 .contains("Unsupported content block type 'input_file'"),
             "Expected clear unsupported-file error, got: {}",
             payload.error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn create_response_keeps_upstream_id_private_but_persists_operational_metadata() {
+        let upstream = MockServer::start().await;
+        let upstream_private_id = "resp_upstream_private_001";
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": upstream_private_id,
+                "model": "gpt-upstream",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_up_1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello"}]
+                }],
+                "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(build_state(&upstream.uri()).await);
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": "codex-main",
+                    "input": "hello"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let downstream_id = payload
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("response should include downstream id");
+
+        assert!(
+            !body
+                .windows(upstream_private_id.len())
+                .any(|w| w == upstream_private_id.as_bytes()),
+            "Downstream payload must not leak upstream private response id"
+        );
+        assert_ne!(
+            downstream_id, upstream_private_id,
+            "Downstream response id must be ModelWire-owned, not upstream-owned"
+        );
+
+        let persisted = get_response(&state.db, downstream_id)
+            .await
+            .unwrap()
+            .expect("response shell should be persisted");
+        assert_eq!(persisted.downstream_model, "codex-main");
+        assert_eq!(persisted.provider_id.as_deref(), Some("provider-a"));
+        assert_eq!(persisted.upstream_model.as_deref(), Some("gpt-upstream"));
+        assert_eq!(persisted.wire_api.as_deref(), Some("responses"));
+        assert_eq!(
+            persisted.upstream_response_id.as_deref(),
+            Some(upstream_private_id)
+        );
+
+        let handle = get_latest_upstream_handle(&state.db, downstream_id)
+            .await
+            .unwrap()
+            .expect("upstream handle should be persisted");
+        assert_eq!(handle.provider_id, "provider-a");
+        assert_eq!(handle.upstream_model, "gpt-upstream");
+        assert_eq!(handle.wire_api, "responses");
+        assert_eq!(
+            handle.upstream_response_id.as_deref(),
+            Some(upstream_private_id)
         );
     }
 
