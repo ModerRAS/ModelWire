@@ -1,7 +1,7 @@
 //! Server application builder and router.
 
 use crate::middleware::{admin_auth, admin_origin, auth, logging, request_id};
-use crate::routes::{health, models, responses};
+use crate::routes::{health, models, response_state, responses};
 use crate::{admin, ServerState};
 use axum::{
     body::Body,
@@ -137,6 +137,14 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/readyz", get(health::readyz))
         .route("/v1", post(responses::create_response))
         .route("/v1/responses", post(responses::create_response))
+        .route(
+            "/v1/responses/:response_id",
+            get(response_state::get_response_by_id),
+        )
+        .route(
+            "/v1/responses/:response_id/input_items",
+            get(response_state::get_response_input_items),
+        )
         .route("/v1/models", get(models::list_models))
         .route("/v1/responses/compact", post(responses::compact_response))
         .route("/v1/*path", any(normalized_api_not_found))
@@ -256,33 +264,50 @@ fn validate_startup_security(
     security: &modelwire_core::SecurityConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bind_is_public = is_public_bind_address(bind);
+    let auth_mode = security.downstream_auth.trim();
+    let relay_key_entries_enabled = security.relay_keys.iter().any(|entry| entry.enabled);
 
-    if security.public_deployment {
-        let auth_mode = security.downstream_auth.trim();
+    if security.public_deployment || bind_is_public {
         if auth_mode.is_empty() || auth_mode == "none" {
-            return Err("Public deployment requires downstream auth. Set downstream_auth to 'relay_key' or similar.".into());
-        }
-        if !security.allow_passthrough_keys
-            && (auth_mode == "passthrough" || auth_mode == "trusted_passthrough")
-        {
             return Err(
-                "Public deployment with passthrough auth requires allow_passthrough_keys=true."
+                "Public bind/deployment requires downstream auth; auth mode 'none' is not allowed."
                     .into(),
             );
         }
+        match auth_mode {
+            "relay_key" => {
+                if !relay_key_entries_enabled {
+                    return Err(
+                        "Public bind/deployment with relay_key auth requires at least one enabled security.relay_keys entry."
+                            .into(),
+                    );
+                }
+            }
+            "managed" => {
+                return Err(
+                    "Public bind/deployment with downstream_auth='managed' is not supported until managed downstream auth validation is implemented."
+                        .into(),
+                );
+            }
+            "passthrough" | "trusted_passthrough" => {
+                if !security.allow_passthrough_keys {
+                    return Err(
+                        "Public bind/deployment rejects passthrough auth unless allow_passthrough_keys=true."
+                            .into(),
+                    );
+                }
+            }
+            _ => {}
+        }
     }
 
-    if bind_is_public {
-        let auth_mode = security.downstream_auth.trim();
-        if auth_mode.is_empty() || auth_mode == "none" {
-            return Err("Public bind address requires downstream auth or explicit unsafe override (not implemented).".into());
-        }
-        if security.public_deployment
-            && !security.allow_passthrough_keys
-            && (auth_mode == "passthrough" || auth_mode == "trusted_passthrough")
-        {
-            return Err("Public bind with public_deployment=true rejects passthrough auth when allow_passthrough_keys=false.".into());
-        }
+    if bind_is_public
+        && (auth_mode == "passthrough" || auth_mode == "trusted_passthrough")
+        && !security.allow_passthrough_keys
+    {
+        return Err(
+            "Public bind rejects passthrough auth unless allow_passthrough_keys=true.".into(),
+        );
     }
 
     Ok(())
@@ -347,10 +372,17 @@ mod tests {
     }
 
     async fn build_min_state() -> Arc<ServerState> {
+        let relay_secret = "test-relay-secret";
         let config = Config {
             server: ServerConfig::default(),
             security: SecurityConfig {
-                downstream_auth: "none".to_string(),
+                downstream_auth: "relay_key".to_string(),
+                log_secret: Some(relay_secret.to_string()),
+                relay_keys: vec![modelwire_core::RelayKeyConfig {
+                    key_hash: modelwire_core::hash_key_for_logging("mw_test_key", relay_secret),
+                    enabled: true,
+                    ..modelwire_core::RelayKeyConfig::default()
+                }],
                 ..SecurityConfig::default()
             },
             archive: ArchiveConfig::default(),
@@ -400,7 +432,7 @@ mod tests {
             probe_locks: dashmap::DashMap::new(),
             key_limiter_counters: dashmap::DashMap::new(),
             ip_limiter_counters: dashmap::DashMap::new(),
-            archive_writer: tokio::sync::Mutex::new(None),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -433,10 +465,39 @@ mod tests {
             public_deployment: true,
             downstream_auth: "relay_key".to_string(),
             allow_passthrough_keys: false,
+            relay_keys: vec![modelwire_core::RelayKeyConfig {
+                key_hash: "hash1".to_string(),
+                enabled: true,
+                ..modelwire_core::RelayKeyConfig::default()
+            }],
             ..SecurityConfig::default()
         };
         let result = validate_startup_security("0.0.0.0:8787", &security);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn startup_validation_rejects_public_relay_key_without_enabled_keys() {
+        let security = SecurityConfig {
+            public_deployment: true,
+            downstream_auth: "relay_key".to_string(),
+            allow_passthrough_keys: false,
+            relay_keys: vec![],
+            ..SecurityConfig::default()
+        };
+        let result = validate_startup_security("0.0.0.0:8787", &security);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn startup_validation_rejects_public_managed_until_implemented() {
+        let security = SecurityConfig {
+            public_deployment: true,
+            downstream_auth: "managed".to_string(),
+            ..SecurityConfig::default()
+        };
+        let result = validate_startup_security("0.0.0.0:8787", &security);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -550,6 +611,7 @@ mod tests {
         let request = Request::builder()
             .method("GET")
             .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
             .body(Body::empty())
             .unwrap();
 
@@ -581,6 +643,7 @@ mod tests {
         let request = Request::builder()
             .method("GET")
             .uri("/healthz")
+            .header("authorization", "Bearer mw_test_key")
             .header("x-request-id", "req_mw_acceptance_001")
             .body(Body::empty())
             .unwrap();

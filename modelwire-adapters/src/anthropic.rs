@@ -91,6 +91,23 @@ impl UpstreamAdapter for AnthropicAdapter {
                         }],
                     }));
                 }
+                modelwire_core::CanonicalInputItem::AssistantFunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                } => {
+                    let parsed_arguments = serde_json::from_str::<serde_json::Value>(arguments)
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    messages.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": call_id,
+                            "name": name,
+                            "input": parsed_arguments,
+                        }],
+                    }));
+                }
             }
         }
 
@@ -130,7 +147,16 @@ impl UpstreamAdapter for AnthropicAdapter {
             body["temperature"] = serde_json::json!(temp);
         }
 
-        debug!(body = %serde_json::to_string_pretty(&body).unwrap_or_default(), "Built Anthropic request");
+        debug!(
+            stream = canonical.stream,
+            messages = body
+                .get("messages")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| items.len())
+                .unwrap_or(0),
+            has_tools = !canonical.tools.is_empty(),
+            "Built Anthropic request"
+        );
 
         UpstreamRequest {
             method: "POST".to_string(),

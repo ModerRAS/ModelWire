@@ -23,23 +23,41 @@ use modelwire_core::{
     ContentBlock, Error, ErrorKind, ProbeResult, ResponseUsage, WireApi,
 };
 use modelwire_db::repo::{
+    archive_files::upsert_archive_file,
     compactions::{store_compaction_lineage, CompactionLineageInsert},
     logs::store_log,
     probes::{get_probe_result, store_probe_result, store_probe_result_detailed},
+    providers::list_providers as list_provider_rows,
     responses::{
         get_items, get_latest_upstream_handle, get_response, store_upstream_handle, ItemRecord,
         ResponseInsert, ResponseItemInsert, UpstreamHandleInsert,
     },
+    routes::{get_route as get_route_row, get_targets as get_targets_row},
 };
 use serde::Serialize;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    convert::Infallible,
+    net::IpAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, warn};
 
+use crate::runtime_config::ensure_operational_config_seeded;
+use crate::secrets::decrypt_managed_key;
 use crate::ServerState;
+
+fn archive_writer_cache_key(root: &str, capture_mode: CaptureMode, period_key: &str) -> String {
+    format!(
+        "{}|{}|{}",
+        root.trim().to_ascii_lowercase(),
+        capture_mode.as_str(),
+        period_key
+    )
+}
 
 #[derive(Debug, Clone)]
 struct ResolvedTargetProtocol {
@@ -82,6 +100,7 @@ struct ContinuationContext {
     previous_provider_id: Option<String>,
     previous_upstream_model: Option<String>,
     previous_wire_api: Option<WireApi>,
+    previous_state_scope: Option<String>,
     previous_credential_hash: Option<String>,
     replay_items: Vec<CanonicalInputItem>,
     known_call_ids: HashSet<String>,
@@ -141,10 +160,24 @@ pub struct StreamingRelayResult {
     pub sse_frames: Vec<Bytes>,
 }
 
+/// Streamed relay bytes for true downstream SSE.
+pub type StreamingRelayChannel = ReceiverStream<Result<Bytes, std::convert::Infallible>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamTimeoutKind {
     Idle,
     MaxDuration,
+}
+
+#[derive(Debug)]
+enum StreamWorkerOutcome {
+    Fallbackable(Error),
+    Fatal(Error),
+}
+
+#[derive(Debug)]
+struct StreamBootstrap {
+    upstream_response_id: Option<String>,
 }
 
 /// Downstream Responses output item.
@@ -222,7 +255,12 @@ pub async fn relay_non_streaming_response_scoped(
         ));
     }
 
-    let route = snapshot_route(&state, &downstream_model, allowed_providers.as_deref())?;
+    let route = snapshot_route(
+        state.as_ref(),
+        &downstream_model,
+        allowed_providers.as_deref(),
+    )
+    .await?;
     let continuation = load_continuation_context(
         &state,
         &raw_json,
@@ -239,6 +277,18 @@ pub async fn relay_non_streaming_response_scoped(
         .unwrap_or(false);
 
     for target in &route.targets {
+        if is_public_bind_address(&state.config.server.bind)
+            && target.context_window_tokens.is_none()
+        {
+            last_error = Some(Error::new(
+                ErrorKind::ContextLengthExceeded,
+                format!(
+                    "Target '{}' is missing required context_window_tokens metadata for public bind",
+                    target.target_id
+                ),
+            ));
+            continue;
+        }
         let mut canonical = parse_canonical_request(
             &request_id,
             &raw_json,
@@ -279,10 +329,18 @@ pub async fn relay_non_streaming_response_scoped(
         .await?;
         let resolved =
             resolve_target_protocol(state.as_ref(), target, upstream_key.as_deref()).await?;
-        let target_context = TargetCallContext {
+        let mut target_context = TargetCallContext {
             upstream_key,
             resolved,
         };
+        ensure_tool_probe_if_needed(
+            state.as_ref(),
+            target,
+            target_context.upstream_key.as_deref(),
+            &mut target_context.resolved,
+            &canonical,
+        )
+        .await?;
         if should_skip_target_for_tool_support(target, &canonical, &target_context.resolved) {
             warn!(
                 request_id = %request_id,
@@ -360,6 +418,9 @@ pub async fn relay_streaming_response(
 }
 
 /// Run streaming Responses relay path with optional provider scope and return downstream SSE frames.
+///
+/// Internal relay path currently collects canonical SSE frames before returning.
+/// Route layer still streams to downstream socket using `Body::from_stream`.
 pub async fn relay_streaming_response_scoped(
     state: Arc<ServerState>,
     request_id: String,
@@ -367,8 +428,41 @@ pub async fn relay_streaming_response_scoped(
     downstream_authorization: Option<String>,
     allowed_providers: Option<Vec<String>>,
 ) -> Result<StreamingRelayResult, Error> {
+    let mut stream = relay_streaming_response_stream_scoped(
+        state,
+        request_id,
+        raw_json,
+        downstream_authorization,
+        allowed_providers,
+    )
+    .await?;
+    let mut frames = Vec::new();
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        let bytes = chunk.unwrap_or_else(|never| match never {});
+        frames.push(bytes);
+    }
+    Ok(StreamingRelayResult { sse_frames: frames })
+}
+
+/// Run streaming Responses relay path and return a true streaming channel.
+///
+/// NOTE: This is downstream-socket streaming. It does not currently guarantee
+/// token-by-token pass-through from upstream; relay normalizes upstream events
+/// before emitting.
+pub async fn relay_streaming_response_stream_scoped(
+    state: Arc<ServerState>,
+    request_id: String,
+    raw_json: serde_json::Value,
+    downstream_authorization: Option<String>,
+    allowed_providers: Option<Vec<String>>,
+) -> Result<StreamingRelayChannel, Error> {
     let downstream_model = require_string(&raw_json, "model")?.to_string();
-    let route = snapshot_route(&state, &downstream_model, allowed_providers.as_deref())?;
+    let route = snapshot_route(
+        state.as_ref(),
+        &downstream_model,
+        allowed_providers.as_deref(),
+    )
+    .await?;
     let continuation = load_continuation_context(
         &state,
         &raw_json,
@@ -384,6 +478,18 @@ pub async fn relay_streaming_response_scoped(
         .map(|items| !items.is_empty())
         .unwrap_or(false);
     for target in &route.targets {
+        if is_public_bind_address(&state.config.server.bind)
+            && target.context_window_tokens.is_none()
+        {
+            last_error = Some(Error::new(
+                ErrorKind::ContextLengthExceeded,
+                format!(
+                    "Target '{}' is missing required context_window_tokens metadata for public bind",
+                    target.target_id
+                ),
+            ));
+            continue;
+        }
         let mut canonical = parse_canonical_request(
             &request_id,
             &raw_json,
@@ -424,10 +530,18 @@ pub async fn relay_streaming_response_scoped(
         .await?;
         let resolved =
             resolve_target_protocol(state.as_ref(), target, upstream_key.as_deref()).await?;
-        let target_context = TargetCallContext {
+        let mut target_context = TargetCallContext {
             upstream_key,
             resolved,
         };
+        ensure_tool_probe_if_needed(
+            state.as_ref(),
+            target,
+            target_context.upstream_key.as_deref(),
+            &mut target_context.resolved,
+            &canonical,
+        )
+        .await?;
         if should_skip_target_for_tool_support(target, &canonical, &target_context.resolved) {
             warn!(
                 request_id = %request_id,
@@ -445,14 +559,24 @@ pub async fn relay_streaming_response_scoped(
             continue;
         }
 
-        match try_target_streaming(&state, &route, target, canonical, target_context).await {
-            Ok(result) => return Ok(result),
+        let route_clone = route.clone();
+        let target_clone = target.clone();
+        match start_streaming_target_channel(
+            Arc::clone(&state),
+            route_clone,
+            target_clone,
+            canonical,
+            target_context,
+        )
+        .await
+        {
+            Ok(stream) => return Ok(stream),
             Err(error) if error.kind.is_fallback_eligible() => {
                 warn!(
                     request_id = %request_id,
                     target_id = %target.target_id,
                     error_kind = %error.kind,
-                    "Streaming target failed before commit; trying next target"
+                    "Streaming target failed before downstream commit; trying next target"
                 );
                 last_error = Some(error);
             }
@@ -510,7 +634,12 @@ pub async fn relay_compact_response_scoped(
     _archive_capture_mode_override: Option<String>,
 ) -> Result<serde_json::Value, Error> {
     let downstream_model = require_string(&raw_json, "model")?.to_string();
-    let route = snapshot_route(&state, &downstream_model, allowed_providers.as_deref())?;
+    let route = snapshot_route(
+        state.as_ref(),
+        &downstream_model,
+        allowed_providers.as_deref(),
+    )
+    .await?;
     let source_state = load_compaction_source_state(state.as_ref(), &raw_json).await?;
     let compact_mode = state.config.server.compaction_mode.as_str();
     let allow_native = matches!(compact_mode, "native_responses" | "hybrid");
@@ -570,34 +699,71 @@ pub async fn relay_compact_response_scoped(
     }))
 }
 
-fn snapshot_route(
+async fn snapshot_route(
     state: &ServerState,
     downstream_model: &str,
     allowed_providers: Option<&[String]>,
 ) -> Result<RouteSnapshot, Error> {
-    let route = match state.config.get_route(downstream_model) {
-        Some(route) if route.enabled => route,
-        Some(_) => {
-            return Err(Error::new(
-                ErrorKind::ModelNotFound,
-                format!("Model '{downstream_model}' is disabled"),
-            ));
-        }
-        None => {
-            return Err(Error::new(
+    ensure_operational_config_seeded(state).await?;
+
+    let route_row = get_route_row(&state.db, downstream_model)
+        .await
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::InternalError,
+                format!("Failed to read route mapping for model '{downstream_model}': {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            Error::new(
                 ErrorKind::ModelNotFound,
                 format!("Model '{downstream_model}' not found"),
-            ));
-        }
-    };
+            )
+        })?;
 
-    let mut targets = Vec::new();
-    for target in state.config.get_sorted_targets(route) {
-        let Some(provider) = state.config.get_provider(&target.provider) else {
+    if route_row.enabled == 0 {
+        return Err(Error::new(
+            ErrorKind::ModelNotFound,
+            format!("Model '{downstream_model}' is disabled"),
+        ));
+    }
+
+    let targets = get_targets_row(&state.db, &route_row.id)
+        .await
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::InternalError,
+                format!(
+                    "Failed to read targets for route '{}': {error}",
+                    route_row.id
+                ),
+            )
+        })?;
+
+    let providers = list_provider_rows(&state.db).await.map_err(|error| {
+        Error::new(
+            ErrorKind::InternalError,
+            format!("Failed to read providers for route snapshot: {error}"),
+        )
+    })?;
+    let providers_by_id: std::collections::HashMap<
+        String,
+        modelwire_db::repo::providers::ProviderRecord,
+    > = providers
+        .into_iter()
+        .map(|provider| (provider.id.clone(), provider))
+        .collect();
+
+    let mut out_targets = Vec::new();
+    for target in targets {
+        if target.enabled == 0 {
+            continue;
+        }
+        let Some(provider) = providers_by_id.get(&target.provider_id) else {
             warn!(
                 downstream_model = %downstream_model,
-                provider_id = %target.provider,
-                "Route target references missing provider; skipping"
+                provider_id = %target.provider_id,
+                "Route target references missing provider row; skipping"
             );
             continue;
         };
@@ -611,13 +777,68 @@ fn snapshot_route(
             }
         }
 
-        // SSRF protection: validate provider URL
-        use modelwire_core::validate_provider_url_for_provider;
+        let provider_cfg = serde_json::from_str::<serde_json::Value>(&provider.config_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let allow_private_ips = provider_cfg
+            .get("allow_private_ips")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let skip_ssrf_validation = provider_cfg
+            .get("skip_ssrf_validation")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let managed_key_ciphertext = provider_cfg
+            .get("managed_api_key")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        let managed_key = if provider.auth_mode == "managed" {
+            match managed_key_ciphertext {
+                Some(ciphertext) if ciphertext.starts_with("mwenc:v1:") => {
+                    let Some(secret) = state
+                        .config
+                        .security
+                        .managed_key_encryption_secret
+                        .as_deref()
+                    else {
+                        warn!(
+                            downstream_model = %downstream_model,
+                            provider_id = %provider.id,
+                            "managed_key_encryption_secret is missing; skipping managed provider with encrypted key"
+                        );
+                        continue;
+                    };
+                    match decrypt_managed_key(&ciphertext, secret) {
+                        Ok(plaintext) => Some(plaintext),
+                        Err(error) => {
+                            warn!(
+                                downstream_model = %downstream_model,
+                                provider_id = %provider.id,
+                                error = %error.message,
+                                "Failed to decrypt managed provider key; skipping provider"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                Some(plaintext_legacy) => {
+                    warn!(
+                        downstream_model = %downstream_model,
+                        provider_id = %provider.id,
+                        "Managed provider key is stored in legacy plaintext form; consider rotating via admin API to re-encrypt"
+                    );
+                    Some(plaintext_legacy)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
 
-        // Skip validation if provider explicitly opts out (for testing/trusted networks)
-        if !provider.skip_ssrf_validation {
-            match validate_provider_url_for_provider(&provider.base_url, provider.allow_private_ips)
-            {
+        if !skip_ssrf_validation {
+            match modelwire_core::validate_provider_url_for_provider(
+                &provider.base_url,
+                allow_private_ips,
+            ) {
                 modelwire_core::SsrfValidationResult::Blocked { reason } => {
                     warn!(
                         downstream_model = %downstream_model,
@@ -630,45 +851,62 @@ fn snapshot_route(
                 }
                 modelwire_core::SsrfValidationResult::Safe => {}
             }
+
+            if let Err(error) =
+                validate_provider_dns_resolution(&provider.base_url, allow_private_ips).await
+            {
+                warn!(
+                    downstream_model = %downstream_model,
+                    provider_id = %provider.id,
+                    base_url = %provider.base_url,
+                    error = %error.message,
+                    "Provider URL blocked by DNS SSRF validation; skipping"
+                );
+                continue;
+            }
         }
 
+        let target_cfg = serde_json::from_str::<serde_json::Value>(&target.config_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
         let configured_wire_api = WireApi::parse(&target.wire_api)
             .or_else(|| WireApi::parse(&provider.default_wire_api))
             .unwrap_or(WireApi::Auto);
 
-        targets.push(TargetSnapshot {
-            target_id: format!(
-                "{}:{}:{}",
-                route
-                    .id
-                    .clone()
-                    .unwrap_or_else(|| route.downstream_model.clone()),
-                target.provider,
-                target.priority
-            ),
+        out_targets.push(TargetSnapshot {
+            target_id: target.id.clone(),
             provider_id: provider.id.clone(),
             provider_name: provider.name.clone(),
             provider_base_url: provider.base_url.clone(),
             provider_auth_mode: provider.auth_mode.clone(),
-            provider_api_key: provider.api_key.clone(),
+            provider_api_key: managed_key,
             state_scope: provider.state_scope.clone(),
             upstream_model: target.upstream_model.clone(),
             configured_wire_api,
             priority: target.priority,
-            context_window_tokens: target.context_window_tokens,
-            max_output_tokens: target.max_output_tokens,
-            context_safety_margin_tokens: target.context_safety_margin_tokens,
-            context_overflow_policy: target.context_overflow_policy.clone(),
+            context_window_tokens: target_cfg
+                .get("context_window_tokens")
+                .and_then(serde_json::Value::as_u64),
+            max_output_tokens: target_cfg
+                .get("max_output_tokens")
+                .and_then(serde_json::Value::as_u64),
+            context_safety_margin_tokens: target_cfg
+                .get("context_safety_margin_tokens")
+                .and_then(serde_json::Value::as_u64),
+            context_overflow_policy: target_cfg
+                .get("context_overflow_policy")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("reject")
+                .to_string(),
         });
     }
 
-    if targets.is_empty() {
+    if out_targets.is_empty() {
         if allowed_providers.is_some() {
             return Err(Error::new(
                 ErrorKind::AuthFailed,
                 format!(
                     "Relay key is not allowed to access any provider for model '{}'",
-                    route.downstream_model
+                    route_row.downstream_model
                 ),
             ));
         }
@@ -680,12 +918,9 @@ fn snapshot_route(
     }
 
     Ok(RouteSnapshot {
-        route_id: route
-            .id
-            .clone()
-            .unwrap_or_else(|| route.downstream_model.clone()),
-        downstream_model: route.downstream_model.clone(),
-        targets,
+        route_id: route_row.id,
+        downstream_model: route_row.downstream_model,
+        targets: out_targets,
     })
 }
 
@@ -981,7 +1216,7 @@ async fn try_target(
         Some(resolved.wire_api.as_str()),
         Some(200), // success
         None,      // no error
-        None,      // latency not tracked here
+        Some(request_start.elapsed().as_millis() as i64),
         usage.map(|u| u.input_tokens as i64),
         usage.map(|u| u.output_tokens as i64),
     )
@@ -1027,13 +1262,59 @@ async fn try_target(
     Ok(response)
 }
 
-async fn try_target_streaming(
-    state: &ServerState,
-    route: &RouteSnapshot,
-    target: &TargetSnapshot,
+async fn start_streaming_target_channel(
+    state: Arc<ServerState>,
+    route: RouteSnapshot,
+    target: TargetSnapshot,
     canonical: CanonicalResponseRequest,
     target_context: TargetCallContext,
-) -> Result<StreamingRelayResult, Error> {
+) -> Result<StreamingRelayChannel, Error> {
+    let (ready_tx, ready_rx) = oneshot::channel::<Result<StreamBootstrap, StreamWorkerOutcome>>();
+    let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(64);
+
+    tokio::spawn(async move {
+        run_streaming_target_worker(
+            state,
+            route,
+            target,
+            canonical,
+            target_context,
+            ready_tx,
+            tx,
+        )
+        .await;
+    });
+
+    match ready_rx.await {
+        Ok(Ok(bootstrap)) => {
+            if let Some(upstream_response_id) = bootstrap.upstream_response_id {
+                info!(
+                    response_id = %upstream_response_id,
+                    "streaming bootstrap emitted first semantic event"
+                );
+            }
+            Ok(ReceiverStream::new(rx))
+        }
+        Ok(Err(StreamWorkerOutcome::Fallbackable(error))) => Err(error),
+        Ok(Err(StreamWorkerOutcome::Fatal(error))) => Err(error),
+        Err(_dropped) => Err(Error::new(
+            ErrorKind::UpstreamUnavailable,
+            "Streaming worker stopped before downstream commit",
+        )),
+    }
+}
+
+async fn run_streaming_target_worker(
+    state: Arc<ServerState>,
+    route: RouteSnapshot,
+    target: TargetSnapshot,
+    canonical: CanonicalResponseRequest,
+    target_context: TargetCallContext,
+    ready_tx: oneshot::Sender<Result<StreamBootstrap, StreamWorkerOutcome>>,
+    tx: mpsc::Sender<Result<Bytes, Infallible>>,
+) {
+    let request_start = Instant::now();
+    let mut ready_tx = Some(ready_tx);
     let mut canonical = canonical;
     canonical.stream = true;
     let TargetCallContext {
@@ -1048,27 +1329,56 @@ async fn try_target_streaming(
     );
     let url = join_url(&target.provider_base_url, &upstream_request.path);
 
-    let client = build_upstream_client(state.config.server.upstream_timeout_secs)?;
+    let client = match build_upstream_client(state.config.server.upstream_timeout_secs) {
+        Ok(client) => client,
+        Err(error) => {
+            notify_stream_worker_error(&mut ready_tx, StreamWorkerOutcome::Fatal(error));
+            return;
+        }
+    };
 
-    let method = upstream_request
-        .method
-        .parse()
-        .map_err(|_| Error::new(ErrorKind::InternalError, "Invalid upstream HTTP method"))?;
+    let method = match upstream_request.method.parse() {
+        Ok(method) => method,
+        Err(_) => {
+            notify_stream_worker_error(
+                &mut ready_tx,
+                StreamWorkerOutcome::Fatal(Error::new(
+                    ErrorKind::InternalError,
+                    "Invalid upstream HTTP method",
+                )),
+            );
+            return;
+        }
+    };
+
     let mut builder = client.request(method, url);
     for (name, value) in upstream_request.headers {
         builder = builder.header(name, value);
     }
 
-    let upstream_response = builder
-        .json(&upstream_request.body)
-        .send()
-        .await
-        .map_err(map_reqwest_error)?;
+    let upstream_response = match builder.json(&upstream_request.body).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            notify_stream_worker_error(
+                &mut ready_tx,
+                StreamWorkerOutcome::Fallbackable(map_reqwest_error(error)),
+            );
+            return;
+        }
+    };
 
     if !upstream_response.status().is_success() {
         let status = upstream_response.status().as_u16();
-        let bytes = upstream_response.bytes().await.map_err(map_reqwest_error)?;
-        // Log failed streaming request for audit
+        let bytes = match upstream_response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                notify_stream_worker_error(
+                    &mut ready_tx,
+                    StreamWorkerOutcome::Fallbackable(map_reqwest_error(error)),
+                );
+                return;
+            }
+        };
         let _ = store_log(
             &state.db,
             &canonical.request_id,
@@ -1081,26 +1391,39 @@ async fn try_target_streaming(
             Some(resolved.wire_api.as_str()),
             Some(status as i32),
             Some("upstream_error"),
-            None, // latency
-            None, // input_tokens
-            None, // output_tokens
+            Some(request_start.elapsed().as_millis() as i64),
+            None,
+            None,
         )
         .await;
-        return Err(map_upstream_status(status, &bytes));
+        notify_stream_worker_error(
+            &mut ready_tx,
+            StreamWorkerOutcome::Fallbackable(map_upstream_status(status, &bytes)),
+        );
+        return;
     }
 
     let mut upstream_body = upstream_response.bytes_stream();
     let mut parse_buffer = bytes::BytesMut::new();
     let mut sse_writer = SseWriter::new();
+    let downstream_stream_response_id = modelwire_core::generate_response_id();
+    let mut stream_item_id_map: HashMap<String, String> = HashMap::new();
     let mut emitted_any_semantic = false;
+    let mut sent_downstream_created = false;
     let mut collected_events: Vec<CanonicalEvent> = Vec::new();
     let mut fallback_after_commit_error: Option<Error> = None;
+    let mut first_upstream_response_id: Option<String> = None;
+    let mut committed = false;
     let stream_started_at = Instant::now();
     let mut last_activity_at = stream_started_at;
     let idle_timeout = duration_from_secs_option(state.config.server.stream_idle_timeout_secs);
     let max_duration = duration_from_secs_option(state.config.server.max_stream_duration_secs);
 
     loop {
+        if tx.is_closed() {
+            return;
+        }
+
         let deadline = next_stream_deadline(
             stream_started_at,
             last_activity_at,
@@ -1113,12 +1436,16 @@ async fn try_target_streaming(
             {
                 Ok(chunk) => chunk,
                 Err(_) => {
-                    let timeout_error = stream_timeout_error(timeout_kind, state);
+                    let timeout_error = stream_timeout_error(timeout_kind, state.as_ref());
                     if emitted_any_semantic {
                         fallback_after_commit_error = Some(timeout_error);
                         break;
                     }
-                    return Err(timeout_error);
+                    notify_stream_worker_error(
+                        &mut ready_tx,
+                        StreamWorkerOutcome::Fallbackable(timeout_error),
+                    );
+                    return;
                 }
             }
         } else {
@@ -1137,13 +1464,20 @@ async fn try_target_streaming(
                     fallback_after_commit_error = Some(mapped);
                     break;
                 }
-                return Err(mapped);
+                notify_stream_worker_error(
+                    &mut ready_tx,
+                    StreamWorkerOutcome::Fallbackable(mapped),
+                );
+                return;
             }
         };
         last_activity_at = Instant::now();
         let frames = extract_sse_frames(&mut parse_buffer, &chunk);
 
         for frame in frames {
+            if tx.is_closed() {
+                return;
+            }
             let parsed = parse_raw_sse_frame(&*adapter, frame);
             let parsed_event = match parsed {
                 Ok(event) => event,
@@ -1152,7 +1486,11 @@ async fn try_target_streaming(
                         fallback_after_commit_error = Some(error);
                         break;
                     }
-                    return Err(error);
+                    notify_stream_worker_error(
+                        &mut ready_tx,
+                        StreamWorkerOutcome::Fallbackable(error),
+                    );
+                    return;
                 }
             };
             let Some(event) = parsed_event else {
@@ -1169,28 +1507,79 @@ async fn try_target_streaming(
                     | CanonicalEvent::ResponseCompleted { .. }
                     | CanonicalEvent::ResponseFailed { .. }
             );
-            if is_semantic {
-                emitted_any_semantic = true;
+            if !is_semantic {
+                continue;
+            }
+            emitted_any_semantic = true;
+            if first_upstream_response_id.is_none() {
+                first_upstream_response_id = match &event {
+                    CanonicalEvent::ResponseCreated { response_id, .. }
+                        if !response_id.is_empty() =>
+                    {
+                        Some(response_id.clone())
+                    }
+                    _ => None,
+                };
             }
 
-            let (event_type, payload) = canonical_to_sse(&event);
-            if event_type != SseEventType::Unknown {
-                sse_writer.write_event(event_type, &payload);
+            let downstream_event = rewrite_stream_event_for_downstream(
+                event,
+                &downstream_stream_response_id,
+                &route.downstream_model,
+                &mut stream_item_id_map,
+            );
+            if !sent_downstream_created {
+                if !matches!(downstream_event, CanonicalEvent::ResponseCreated { .. }) {
+                    let created_event = CanonicalEvent::ResponseCreated {
+                        response_id: downstream_stream_response_id.clone(),
+                        model: route.downstream_model.clone(),
+                        created_at: chrono::Utc::now().timestamp(),
+                    };
+                    let (created_type, created_payload) = canonical_to_sse(&created_event);
+                    sse_writer.write_event(created_type, &created_payload);
+                    collected_events.push(created_event);
+                }
+                sent_downstream_created = true;
             }
-            collected_events.push(event);
+            let (event_type, payload) = canonical_to_sse(&downstream_event);
+            if event_type == SseEventType::Unknown {
+                continue;
+            }
+            sse_writer.write_event(event_type, &payload);
+            collected_events.push(downstream_event);
+
+            if let Some(bytes) = flush_event_bytes(&mut sse_writer) {
+                if !tx_send_frame(&tx, bytes).await {
+                    return;
+                }
+                if !committed {
+                    committed = true;
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(Ok(StreamBootstrap {
+                            upstream_response_id: first_upstream_response_id.clone(),
+                        }));
+                    }
+                }
+            }
         }
+
         if fallback_after_commit_error.is_some() {
             break;
         }
     }
 
-    if !emitted_any_semantic {
-        return Err(Error::new(
-            ErrorKind::UpstreamUnavailable,
-            "Upstream stream ended before first semantic event",
-        ));
+    if !emitted_any_semantic || !committed {
+        notify_stream_worker_error(
+            &mut ready_tx,
+            StreamWorkerOutcome::Fallbackable(Error::new(
+                ErrorKind::UpstreamUnavailable,
+                "Upstream stream ended before first semantic event",
+            )),
+        );
+        return;
     }
 
+    let had_post_commit_failure = fallback_after_commit_error.is_some();
     if let Some(error) = fallback_after_commit_error.take() {
         let payload = serde_json::json!({
             "error": {
@@ -1202,14 +1591,26 @@ async fn try_target_streaming(
         sse_writer.write_event(SseEventType::ResponseFailed, &payload);
     }
 
-    let downstream =
-        normalize_downstream_response(&route.downstream_model, collected_events.clone())?;
+    if let Some(bytes) = flush_event_bytes(&mut sse_writer) {
+        if !tx_send_frame(&tx, bytes).await {
+            return;
+        }
+    }
+
+    let downstream = match normalize_downstream_response_with_id(
+        &route.downstream_model,
+        collected_events.clone(),
+        downstream_stream_response_id,
+    ) {
+        Ok(response) => response,
+        Err(_error) => return,
+    };
     let upstream_response_id = extract_upstream_response_id(&collected_events);
     persist_response_shell(
-        state,
+        state.as_ref(),
         &canonical.request_id,
-        route,
-        target,
+        &route,
+        &target,
         &resolved,
         &downstream,
         PersistHints {
@@ -1219,12 +1620,56 @@ async fn try_target_streaming(
     )
     .await;
 
-    let mut frames = Vec::new();
-    let bytes = sse_writer.flush();
-    if !bytes.is_empty() {
-        frames.push(bytes);
+    let usage = downstream.usage.as_ref();
+    let status_code = if had_post_commit_failure {
+        Some(502)
+    } else {
+        Some(200)
+    };
+    let error_kind = if had_post_commit_failure {
+        Some(ErrorKind::StreamInterrupted.to_string())
+    } else {
+        None
+    };
+    let _ = store_log(
+        &state.db,
+        &canonical.request_id,
+        None,
+        Some(&route.downstream_model),
+        Some(&route.route_id),
+        Some(&target.target_id),
+        Some(&target.provider_id),
+        Some(&target.upstream_model),
+        Some(resolved.wire_api.as_str()),
+        status_code,
+        error_kind.as_deref(),
+        Some(request_start.elapsed().as_millis() as i64),
+        usage.map(|u| u.input_tokens as i64),
+        usage.map(|u| u.output_tokens as i64),
+    )
+    .await;
+}
+
+fn notify_stream_worker_error(
+    ready_tx: &mut Option<oneshot::Sender<Result<StreamBootstrap, StreamWorkerOutcome>>>,
+    outcome: StreamWorkerOutcome,
+) {
+    if let Some(tx) = ready_tx.take() {
+        let _ = tx.send(Err(outcome));
     }
-    Ok(StreamingRelayResult { sse_frames: frames })
+}
+
+fn flush_event_bytes(sse_writer: &mut SseWriter) -> Option<Bytes> {
+    let bytes = sse_writer.flush();
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(bytes)
+    }
+}
+
+async fn tx_send_frame(tx: &mpsc::Sender<Result<Bytes, Infallible>>, bytes: Bytes) -> bool {
+    tx.send(Ok(bytes)).await.is_ok()
 }
 
 fn duration_from_secs_option(seconds: u64) -> Option<Duration> {
@@ -1908,6 +2353,20 @@ fn context_guard_check(
     let margin = target.context_safety_margin_tokens.unwrap_or(2048);
     let safe_budget = window.saturating_sub(margin);
     let estimated = estimate_request_tokens(canonical);
+    if let (Some(requested), Some(target_limit)) =
+        (canonical.max_output_tokens, target.max_output_tokens)
+    {
+        if (requested as u64) > target_limit {
+            return Err(Error::new(
+                ErrorKind::ContextLengthExceeded,
+                format!(
+                    "Requested max_output_tokens {} exceeds target limit {} for target '{}'",
+                    requested, target_limit, target.target_id
+                ),
+            ));
+        }
+    }
+
     let requested_output = canonical
         .max_output_tokens
         .or(target.max_output_tokens.map(|v| v as u32))
@@ -1954,59 +2413,75 @@ fn should_skip_target_for_tool_support(
 }
 
 fn estimate_request_tokens(canonical: &CanonicalResponseRequest) -> u64 {
-    let mut chars = 0usize;
+    let mut tokens = 0u64;
     if let Some(instructions) = canonical.instructions.as_ref() {
-        chars = chars.saturating_add(instructions.content.len());
+        tokens = tokens.saturating_add(estimate_text_tokens(&instructions.content));
     }
 
     for item in &canonical.input {
         match item {
             CanonicalInputItem::Text { content } => {
-                chars = chars.saturating_add(content.len());
+                tokens = tokens.saturating_add(estimate_text_tokens(content));
             }
             CanonicalInputItem::Message { content, .. } => {
                 for block in content {
                     match block {
                         ContentBlock::Text { text } => {
-                            chars = chars.saturating_add(text.len());
+                            tokens = tokens.saturating_add(estimate_text_tokens(text));
                         }
                         ContentBlock::InputJson { json } => {
-                            chars = chars.saturating_add(json.len());
+                            tokens = tokens.saturating_add(estimate_text_tokens(json));
                         }
                         ContentBlock::Reasoning { summary, .. } => {
                             for part in summary {
                                 if let Some(text) = part.text.as_ref() {
-                                    chars = chars.saturating_add(text.len());
+                                    tokens = tokens.saturating_add(estimate_text_tokens(text));
                                 }
                             }
                         }
                         ContentBlock::Image { data, .. } => {
-                            chars = chars.saturating_add(data.len());
+                            tokens = tokens.saturating_add((data.len() as u64).div_ceil(2));
                         }
                     }
                 }
             }
             CanonicalInputItem::FunctionCallOutput { output, .. } => {
-                chars = chars.saturating_add(output.len());
+                tokens = tokens.saturating_add(estimate_text_tokens(output));
+            }
+            CanonicalInputItem::AssistantFunctionCall {
+                name, arguments, ..
+            } => {
+                tokens = tokens.saturating_add(estimate_text_tokens(name));
+                tokens = tokens.saturating_add(estimate_text_tokens(arguments));
             }
         }
     }
 
     for tool in &canonical.tools {
-        chars = chars.saturating_add(tool.name.len());
-        chars = chars.saturating_add(tool.description.len());
-        chars = chars.saturating_add(tool.parameters.to_string().len());
+        tokens = tokens.saturating_add(estimate_text_tokens(&tool.name));
+        tokens = tokens.saturating_add(estimate_text_tokens(&tool.description));
+        tokens = tokens.saturating_add(estimate_text_tokens(&tool.parameters.to_string()));
     }
 
-    let approx_tokens = (chars as u64).saturating_add(3) / 4;
-    approx_tokens.max(1)
+    tokens.max(1)
 }
 
 fn normalize_downstream_response(
     downstream_model: &str,
     events: Vec<CanonicalEvent>,
 ) -> Result<DownstreamResponse, Error> {
-    let response_id = modelwire_core::generate_response_id();
+    normalize_downstream_response_with_id(
+        downstream_model,
+        events,
+        modelwire_core::generate_response_id(),
+    )
+}
+
+fn normalize_downstream_response_with_id(
+    downstream_model: &str,
+    events: Vec<CanonicalEvent>,
+    response_id: String,
+) -> Result<DownstreamResponse, Error> {
     let mut output = Vec::new();
     let mut usage = None;
 
@@ -2036,9 +2511,116 @@ fn normalize_downstream_response(
     })
 }
 
+fn rewrite_stream_event_for_downstream(
+    event: CanonicalEvent,
+    downstream_response_id: &str,
+    downstream_model: &str,
+    item_id_map: &mut HashMap<String, String>,
+) -> CanonicalEvent {
+    match event {
+        CanonicalEvent::ResponseCreated { created_at, .. } => CanonicalEvent::ResponseCreated {
+            response_id: downstream_response_id.to_string(),
+            model: downstream_model.to_string(),
+            created_at,
+        },
+        CanonicalEvent::OutputItemAdded { item, .. } => CanonicalEvent::OutputItemAdded {
+            response_id: downstream_response_id.to_string(),
+            item: rewrite_output_item_ids(item, item_id_map),
+        },
+        CanonicalEvent::OutputTextDelta { item_id, delta } => CanonicalEvent::OutputTextDelta {
+            item_id: map_stream_item_id(item_id, item_id_map),
+            delta,
+        },
+        CanonicalEvent::FunctionCallArgumentsDelta { item_id, delta } => {
+            CanonicalEvent::FunctionCallArgumentsDelta {
+                item_id: map_stream_item_id(item_id, item_id_map),
+                delta,
+            }
+        }
+        CanonicalEvent::OutputItemDone { item, .. } => CanonicalEvent::OutputItemDone {
+            response_id: downstream_response_id.to_string(),
+            item: rewrite_output_item_ids(item, item_id_map),
+        },
+        CanonicalEvent::ReasoningSummaryDelta { item_id, delta } => {
+            CanonicalEvent::ReasoningSummaryDelta {
+                item_id: map_stream_item_id(item_id, item_id_map),
+                delta,
+            }
+        }
+        CanonicalEvent::ResponseCompleted { output, usage, .. } => {
+            CanonicalEvent::ResponseCompleted {
+                response_id: downstream_response_id.to_string(),
+                output: output
+                    .into_iter()
+                    .map(|item| rewrite_output_item_ids(item, item_id_map))
+                    .collect(),
+                usage,
+            }
+        }
+        CanonicalEvent::ResponseFailed { error, .. } => CanonicalEvent::ResponseFailed {
+            response_id: downstream_response_id.to_string(),
+            error,
+        },
+    }
+}
+
+fn rewrite_output_item_ids(
+    item: CanonicalOutputItem,
+    item_id_map: &mut HashMap<String, String>,
+) -> CanonicalOutputItem {
+    match item {
+        CanonicalOutputItem::Message { id, role, content } => CanonicalOutputItem::Message {
+            id: map_stream_message_id(id, item_id_map),
+            role,
+            content,
+        },
+        CanonicalOutputItem::FunctionCall {
+            id,
+            call_id,
+            name,
+            arguments,
+        } => CanonicalOutputItem::FunctionCall {
+            id: map_stream_message_id(id, item_id_map),
+            call_id,
+            name,
+            arguments,
+        },
+        CanonicalOutputItem::Reasoning { id, summary } => CanonicalOutputItem::Reasoning {
+            id: map_stream_message_id(id, item_id_map),
+            summary,
+        },
+    }
+}
+
+fn map_stream_message_id(id: String, item_id_map: &mut HashMap<String, String>) -> String {
+    if modelwire_core::is_modelwire_id(&id) {
+        return id;
+    }
+    if id.is_empty() {
+        return modelwire_core::generate_message_id();
+    }
+    item_id_map
+        .entry(id)
+        .or_insert_with(modelwire_core::generate_message_id)
+        .clone()
+}
+
+fn map_stream_item_id(id: String, item_id_map: &mut HashMap<String, String>) -> String {
+    if modelwire_core::is_modelwire_id(&id) {
+        return id;
+    }
+    if id.is_empty() {
+        return modelwire_core::generate_message_id();
+    }
+    item_id_map
+        .entry(id)
+        .or_insert_with(modelwire_core::generate_message_id)
+        .clone()
+}
+
 fn normalize_output_item(item: CanonicalOutputItem) -> DownstreamOutputItem {
     match item {
-        CanonicalOutputItem::Message { role, content, .. } => {
+        CanonicalOutputItem::Message { id, role, content } => {
             let content = content
                 .into_iter()
                 .filter_map(|block| match block {
@@ -2051,26 +2633,38 @@ fn normalize_output_item(item: CanonicalOutputItem) -> DownstreamOutputItem {
                 .collect();
 
             DownstreamOutputItem::Message {
-                id: modelwire_core::generate_message_id(),
+                id: if modelwire_core::is_modelwire_id(&id) {
+                    id
+                } else {
+                    modelwire_core::generate_message_id()
+                },
                 status: "completed",
                 role,
                 content,
             }
         }
         CanonicalOutputItem::FunctionCall {
-            name, arguments, ..
-        } => {
-            let call_id = modelwire_core::generate_call_id();
-            DownstreamOutputItem::FunctionCall {
-                id: modelwire_core::generate_call_id(),
-                call_id,
-                name,
-                arguments,
-                status: "completed",
-            }
-        }
-        CanonicalOutputItem::Reasoning { summary, .. } => DownstreamOutputItem::Reasoning {
-            id: modelwire_core::generate_message_id(),
+            id,
+            call_id,
+            name,
+            arguments,
+        } => DownstreamOutputItem::FunctionCall {
+            id: if modelwire_core::is_modelwire_id(&id) {
+                id
+            } else {
+                modelwire_core::generate_message_id()
+            },
+            call_id,
+            name,
+            arguments,
+            status: "completed",
+        },
+        CanonicalOutputItem::Reasoning { id, summary } => DownstreamOutputItem::Reasoning {
+            id: if modelwire_core::is_modelwire_id(&id) {
+                id
+            } else {
+                modelwire_core::generate_message_id()
+            },
             summary: summary
                 .into_iter()
                 .map(|part| serde_json::to_value(part).unwrap_or(serde_json::Value::Null))
@@ -2254,6 +2848,7 @@ fn resolve_upstream_key(
         "managed" => target.provider_api_key.clone(),
         "pass_authorization" => downstream_authorization
             .and_then(strip_bearer)
+            .filter(|token| !token.trim_start().starts_with("mw_"))
             .map(ToOwned::to_owned)
             .or_else(|| target.provider_api_key.clone()),
         _ => target.provider_api_key.clone(),
@@ -2268,6 +2863,32 @@ async fn resolve_upstream_key_checked(
     downstream_model: &str,
     downstream_authorization: Option<&str>,
 ) -> Result<Option<String>, Error> {
+    if target.provider_auth_mode == "pass_authorization"
+        && state.config.security.downstream_auth == "relay_key"
+    {
+        let _ = store_log(
+            &state.db,
+            request_id,
+            None,
+            Some(downstream_model),
+            Some(&route.route_id),
+            Some(&target.target_id),
+            Some(&target.provider_id),
+            Some(&target.upstream_model),
+            None,
+            Some(401),
+            Some("auth_mode_mismatch"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        return Err(Error::new(
+            ErrorKind::AuthFailed,
+            "pass_authorization provider requires downstream passthrough/trusted_passthrough auth; relay_key is not allowed",
+        ));
+    }
+
     let upstream_key = resolve_upstream_key(target, downstream_authorization);
     if target.provider_auth_mode == "managed" && upstream_key.is_none() {
         let _ = store_log(
@@ -2311,7 +2932,20 @@ fn join_url(base_url: &str, path: &str) -> String {
 fn build_upstream_client(timeout_secs: u64) -> Result<reqwest::Client, Error> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.error("Too many redirects");
+            }
+
+            let target = attempt.url();
+            if let modelwire_core::SsrfValidationResult::Blocked { reason } =
+                modelwire_core::validate_redirect_target_url(target, false)
+            {
+                return attempt.error(format!("Redirect target blocked by SSRF policy: {reason}"));
+            }
+
+            attempt.follow()
+        }))
         .build()
         .map_err(|error| {
             Error::new(
@@ -2319,6 +2953,70 @@ fn build_upstream_client(timeout_secs: u64) -> Result<reqwest::Client, Error> {
                 format!("Failed to build upstream client: {error}"),
             )
         })
+}
+
+async fn validate_provider_dns_resolution(
+    provider_base_url: &str,
+    allow_private_ips: bool,
+) -> Result<(), Error> {
+    let Some(host) = modelwire_core::parse_url_host(provider_base_url) else {
+        return Err(Error::new(
+            ErrorKind::RequestInvalid,
+            "Provider URL is missing a valid host",
+        ));
+    };
+
+    if !modelwire_core::host_requires_dns_resolution(&host) {
+        return Ok(());
+    }
+
+    let addrs = tokio::net::lookup_host((host.as_str(), 443))
+        .await
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::RequestInvalid,
+                format!("Failed to resolve provider host '{host}': {error}"),
+            )
+        })?;
+
+    let mut saw_any = false;
+    for addr in addrs {
+        saw_any = true;
+        let ip: IpAddr = addr.ip();
+        if let modelwire_core::SsrfValidationResult::Blocked { reason } =
+            modelwire_core::validate_resolved_ip(ip, allow_private_ips)
+        {
+            return Err(Error::new(
+                ErrorKind::RequestInvalid,
+                format!("Provider host '{host}' resolved to blocked IP {ip}: {reason}"),
+            ));
+        }
+    }
+
+    if !saw_any {
+        return Err(Error::new(
+            ErrorKind::RequestInvalid,
+            format!("Provider host '{host}' resolved to no addresses"),
+        ));
+    }
+
+    Ok(())
+}
+
+fn estimate_text_tokens(text: &str) -> u64 {
+    let chars = text.chars().count() as u64;
+    let base = chars.div_ceil(2);
+    let cjk_bonus = text
+        .chars()
+        .filter(|ch| {
+            let cp = *ch as u32;
+            (0x4E00..=0x9FFF).contains(&cp)
+                || (0x3400..=0x4DBF).contains(&cp)
+                || (0x3040..=0x30FF).contains(&cp)
+                || (0xAC00..=0xD7AF).contains(&cp)
+        })
+        .count() as u64;
+    base.saturating_add(cjk_bonus)
 }
 
 fn require_string<'a>(value: &'a serde_json::Value, field: &str) -> Result<&'a str, Error> {
@@ -2579,15 +3277,9 @@ async fn probe_wire_api(
     credential_hash: &str,
     cache_key: &str,
 ) -> Result<ResolvedTargetProtocol, Error> {
-    let probe_body = serde_json::json!({
-        "model": target.upstream_model,
-        "input": "Reply with OK.",
-        "max_output_tokens": 1,
-        "stream": false
-    });
-
     let mut last_retryable: Option<Error> = None;
     for candidate in [WireApi::Responses, WireApi::Anthropic, WireApi::OpenAiChat] {
+        let probe_body = probe_body_for_wire_api(candidate, &target.upstream_model);
         let probe_result =
             probe_candidate_once(state, target, candidate, upstream_key, &probe_body).await;
 
@@ -2658,6 +3350,182 @@ async fn probe_wire_api(
         ErrorKind::ProtocolNotSupported,
         "No supported upstream protocol found for target",
     ))
+}
+
+fn probe_body_for_wire_api(wire_api: WireApi, upstream_model: &str) -> serde_json::Value {
+    match wire_api {
+        WireApi::Responses | WireApi::Auto => serde_json::json!({
+            "model": upstream_model,
+            "input": "Reply with OK.",
+            "max_output_tokens": 1,
+            "stream": false
+        }),
+        WireApi::OpenAiChat => serde_json::json!({
+            "model": upstream_model,
+            "messages": [{"role":"user","content":"Reply with OK."}],
+            "max_tokens": 1,
+            "stream": false
+        }),
+        WireApi::Anthropic => serde_json::json!({
+            "model": upstream_model,
+            "messages": [{"role":"user","content":"Reply with OK."}],
+            "max_tokens": 1,
+            "stream": false
+        }),
+    }
+}
+
+fn probe_tool_body_for_wire_api(wire_api: WireApi, upstream_model: &str) -> serde_json::Value {
+    match wire_api {
+        WireApi::Responses | WireApi::Auto => serde_json::json!({
+            "model": upstream_model,
+            "input": "Call tool and return.",
+            "tools": [{
+                "type":"function",
+                "name":"probe_tool",
+                "description":"Probe tool support",
+                "parameters":{
+                    "type":"object",
+                    "properties":{"ping":{"type":"string"}},
+                    "required":["ping"]
+                }
+            }],
+            "tool_choice":"auto",
+            "max_output_tokens": 1,
+            "stream": false
+        }),
+        WireApi::OpenAiChat => serde_json::json!({
+            "model": upstream_model,
+            "messages": [{"role":"user","content":"Call tool and return."}],
+            "tools": [{
+                "type":"function",
+                "function":{
+                    "name":"probe_tool",
+                    "description":"Probe tool support",
+                    "parameters":{
+                        "type":"object",
+                        "properties":{"ping":{"type":"string"}},
+                        "required":["ping"]
+                    }
+                }
+            }],
+            "tool_choice":"auto",
+            "max_tokens": 1,
+            "stream": false
+        }),
+        WireApi::Anthropic => serde_json::json!({
+            "model": upstream_model,
+            "messages": [{"role":"user","content":"Call tool and return."}],
+            "tools": [{
+                "name":"probe_tool",
+                "description":"Probe tool support",
+                "input_schema":{
+                    "type":"object",
+                    "properties":{"ping":{"type":"string"}},
+                    "required":["ping"]
+                }
+            }],
+            "max_tokens": 1,
+            "stream": false
+        }),
+    }
+}
+
+async fn ensure_tool_probe_if_needed(
+    state: &ServerState,
+    target: &TargetSnapshot,
+    upstream_key: Option<&str>,
+    resolved: &mut ResolvedTargetProtocol,
+    canonical: &CanonicalResponseRequest,
+) -> Result<(), Error> {
+    if canonical.tools.is_empty() || target.configured_wire_api != WireApi::Auto {
+        return Ok(());
+    }
+    if resolved.tool_support_known {
+        return Ok(());
+    }
+
+    let probe_body = probe_tool_body_for_wire_api(resolved.wire_api, &target.upstream_model);
+    let attempt =
+        probe_candidate_once(state, target, resolved.wire_api, upstream_key, &probe_body).await;
+    let now_ts = chrono::Utc::now().timestamp();
+    let cache_key = probe_cache_key(
+        &target.provider_id,
+        &resolved.credential_hash,
+        &target.upstream_model,
+    );
+
+    match attempt {
+        ProbeAttemptResult::Supported => {
+            resolved.tool_support_known = true;
+            resolved.supports_tools = true;
+            let probe = ProbeResult {
+                provider_id: target.provider_id.clone(),
+                credential_hash: resolved.credential_hash.clone(),
+                upstream_model: target.upstream_model.clone(),
+                wire_api: resolved.wire_api,
+                supports_streaming: false,
+                supports_tools: true,
+                supports_parallel_tool_calls: false,
+                tool_support_known: true,
+                supports_previous_response_id: false,
+                supports_reasoning_encrypted_content: false,
+                supports_reasoning_summary: false,
+                last_success_at: Some(now_ts),
+                last_failure_at: None,
+                failure_kind: None,
+                failure_message_redacted: None,
+                expires_at: now_ts + 3600,
+            };
+            remember_probe(state, &cache_key, &probe);
+            store_probe_result_detailed(&state.db, &probe, "success")
+                .await
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::InternalError,
+                        format!("Failed to store tool probe success: {error}"),
+                    )
+                })?;
+            Ok(())
+        }
+        ProbeAttemptResult::ProtocolUnsupported => {
+            resolved.tool_support_known = true;
+            resolved.supports_tools = false;
+            let probe = ProbeResult {
+                provider_id: target.provider_id.clone(),
+                credential_hash: resolved.credential_hash.clone(),
+                upstream_model: target.upstream_model.clone(),
+                wire_api: resolved.wire_api,
+                supports_streaming: false,
+                supports_tools: false,
+                supports_parallel_tool_calls: false,
+                tool_support_known: true,
+                supports_previous_response_id: false,
+                supports_reasoning_encrypted_content: false,
+                supports_reasoning_summary: false,
+                last_success_at: None,
+                last_failure_at: Some(now_ts),
+                failure_kind: Some("protocol_not_supported".to_string()),
+                failure_message_redacted: Some(
+                    "Tool probe reported protocol unsupported".to_string(),
+                ),
+                expires_at: now_ts + 3600,
+            };
+            remember_probe(state, &cache_key, &probe);
+            store_probe_result_detailed(&state.db, &probe, "failed")
+                .await
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::InternalError,
+                        format!("Failed to store tool probe failure: {error}"),
+                    )
+                })?;
+            Ok(())
+        }
+        ProbeAttemptResult::AuthError(error) => Err(error),
+        ProbeAttemptResult::RetryableFailure(error) => Err(error),
+        ProbeAttemptResult::ModelInvalid(error) => Err(error),
+    }
 }
 
 enum ProbeAttemptResult {
@@ -2853,7 +3721,7 @@ fn parse_raw_sse_frame(
     frame: RawSseFrame,
 ) -> Result<Option<CanonicalEvent>, Error> {
     let event_name = frame.event.unwrap_or_default();
-    if event_name == "[DONE]" {
+    if event_name == "[DONE]" || frame.data.as_slice() == b"[DONE]" {
         return Ok(None);
     }
     adapter
@@ -2919,6 +3787,7 @@ async fn load_continuation_context(
         previous_provider_id: previous.provider_id,
         previous_upstream_model: previous.upstream_model,
         previous_wire_api: previous.wire_api.and_then(|value| WireApi::parse(&value)),
+        previous_state_scope: previous.state_scope,
         previous_credential_hash,
         replay_items,
         known_call_ids,
@@ -2948,16 +3817,25 @@ fn to_replay_input_items(items: &[ItemRecord]) -> Result<Vec<CanonicalInputItem>
             "function_call" => {
                 let value: serde_json::Value =
                     serde_json::from_str(&item.content_json).unwrap_or(serde_json::Value::Null);
-                let output = value
+                let arguments = value
                     .get("arguments")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("{}")
+                    .to_string();
+                let name = value
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown_tool")
                     .to_string();
                 let call_id = item
                     .call_id
                     .clone()
                     .unwrap_or_else(modelwire_core::generate_call_id);
-                replay.push(CanonicalInputItem::FunctionCallOutput { call_id, output });
+                replay.push(CanonicalInputItem::AssistantFunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                });
             }
             "reasoning" => {}
             other => {
@@ -3082,7 +3960,9 @@ fn can_send_upstream_previous_response_id(
         return false;
     };
 
-    if target.provider_id != previous_provider_id {
+    let same_provider = target.provider_id == previous_provider_id;
+    let same_scope = target.state_scope.as_deref() == continuation.previous_state_scope.as_deref();
+    if !same_provider && !same_scope {
         return false;
     }
     if target.upstream_model != previous_upstream_model {
@@ -3094,9 +3974,13 @@ fn can_send_upstream_previous_response_id(
         return false;
     }
 
-    let current_key = resolve_upstream_key(target, downstream_authorization);
-    let current_hash = credential_hash_for_probe(current_key.as_deref(), &target.provider_id);
-    current_hash == previous_credential_hash
+    if same_provider {
+        let current_key = resolve_upstream_key(target, downstream_authorization);
+        let current_hash = credential_hash_for_probe(current_key.as_deref(), &target.provider_id);
+        return current_hash == previous_credential_hash;
+    }
+
+    true
 }
 
 fn should_retry_with_replay_on_missing_handle(
@@ -3235,6 +4119,35 @@ fn conversation_messages_for_capture_mode(
                             "type": "tool_result",
                             "call_id": call_id,
                             "output": detailed.text
+                        })],
+                    });
+                }
+            }
+            CanonicalInputItem::AssistantFunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                let detailed = redactor.redact_detailed(arguments);
+                redaction_count += detailed.redaction_count;
+                if mode == CaptureMode::VisibleOnly {
+                    messages.push(MessageRecord {
+                        role: "assistant".to_string(),
+                        content: vec![serde_json::json!({
+                            "type": "tool_call_summary",
+                            "name": name,
+                            "call_id": call_id,
+                            "arguments_summary": detailed.text.chars().take(256).collect::<String>()
+                        })],
+                    });
+                } else {
+                    messages.push(MessageRecord {
+                        role: "assistant".to_string(),
+                        content: vec![serde_json::json!({
+                            "type": "tool_call",
+                            "name": name,
+                            "call_id": call_id,
+                            "arguments": detailed.text
                         })],
                     });
                 }
@@ -3418,23 +4331,48 @@ async fn archive_successful_response(
         metadata: None,
     };
 
-    let mut guard = state.archive_writer.lock().await;
-    if guard.is_none() {
+    let period_key = chrono::Utc::now().format("%Y-%m").to_string();
+    let mut guard = state.archive_writers.lock().await;
+    let cache_key = archive_writer_cache_key(&state.config.archive.root, capture_mode, &period_key);
+    if !guard.contains_key(&cache_key) {
         let writer = modelwire_archive::writer::ArchiveWriter::new(
             state.config.archive.root.clone(),
             capture_mode,
         )
         .await
         .map_err(|e| e.to_string())?;
-        *guard = Some(writer);
+        guard.insert(cache_key.clone(), writer);
     }
 
-    if let Some(writer) = guard.as_mut() {
-        writer
-            .write_conversation(&record)
-            .await
-            .map_err(|e| e.to_string())?;
-        writer.close_segment().await.map_err(|e| e.to_string())?;
+    let writer = guard
+        .get_mut(&cache_key)
+        .ok_or_else(|| "Archive writer cache unexpectedly missing selected writer".to_string())?;
+    writer
+        .write_conversation(&record)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(file) = writer.close_segment().await.map_err(|e| e.to_string())? {
+        let manifest_json = serde_json::to_string_pretty(writer.manifest())
+            .map_err(|e| format!("Failed to serialize archive manifest: {e}"))?;
+        let path = file.path;
+        let file_path = std::path::Path::new(&state.config.archive.root).join(&path);
+        let byte_size = std::fs::metadata(&file_path)
+            .map_err(|e| format!("Failed to read archive segment metadata: {e}"))?
+            .len() as i64;
+        upsert_archive_file(
+            &state.db,
+            &format!("af_{}", uuid::Uuid::new_v4()),
+            writer.archive_id(),
+            &file.format,
+            &path,
+            Some(byte_size),
+            file.conversation_count.map(|v| v as i64),
+            file.item_count.map(|v| v as i64),
+            Some(&file.checksum),
+            &manifest_json,
+        )
+        .await
+        .map_err(|e| format!("Failed to persist archive file metadata: {e}"))?;
     }
 
     Ok(())
@@ -3534,8 +4472,8 @@ async fn archive_successful_response(
 mod tests {
     use super::*;
     use modelwire_core::{
-        ArchiveConfig, Config, ProviderConfig, RouteConfig, SecurityConfig, ServerConfig,
-        TargetConfig,
+        hash_key_for_logging, ArchiveConfig, Config, ProviderConfig, RelayKeyConfig, RouteConfig,
+        SecurityConfig, ServerConfig, TargetConfig,
     };
     use modelwire_db::Database;
     use std::sync::Arc;
@@ -3613,7 +4551,9 @@ mod tests {
             },
         );
 
-        let route = snapshot_route(state.as_ref(), "codex-main", None).unwrap();
+        let route = snapshot_route(state.as_ref(), "codex-main", None)
+            .await
+            .unwrap();
         let target = route.targets.first().unwrap();
         let resolved = resolve_target_protocol(state.as_ref(), target, Some("provider-key"))
             .await
@@ -3625,18 +4565,30 @@ mod tests {
     #[tokio::test]
     async fn probe_404_advances_to_next_protocol() {
         let mock = MockServer::start().await;
+        let captured_responses = Arc::new(std::sync::Mutex::new(None));
+        let captured_responses_clone = Arc::clone(&captured_responses);
         Mock::given(method("POST"))
             .and(path("/responses"))
-            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                *captured_responses_clone.lock().unwrap() = Some(body);
+                ResponseTemplate::new(404).set_body_string("not found")
+            })
             .expect(1)
             .mount(&mock)
             .await;
+        let captured_messages = Arc::new(std::sync::Mutex::new(None));
+        let captured_messages_clone = Arc::clone(&captured_messages);
         Mock::given(method("POST"))
             .and(path("/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "msg_1",
-                "model": "claude"
-            })))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                *captured_messages_clone.lock().unwrap() = Some(body);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "msg_1",
+                    "model": "claude"
+                }))
+            })
             .expect(1)
             .mount(&mock)
             .await;
@@ -3648,12 +4600,105 @@ mod tests {
             .await;
 
         let state = Arc::new(build_state_with_single_target(&mock.uri(), "auto", Some("k1")).await);
-        let route = snapshot_route(state.as_ref(), "codex-main", None).unwrap();
+        let route = snapshot_route(state.as_ref(), "codex-main", None)
+            .await
+            .unwrap();
         let target = route.targets.first().unwrap();
         let resolved = resolve_target_protocol(state.as_ref(), target, Some("k1"))
             .await
             .unwrap();
         assert_eq!(resolved.wire_api, WireApi::Anthropic);
+
+        let responses_body = captured_responses.lock().unwrap();
+        let responses_body = responses_body
+            .as_ref()
+            .expect("responses probe request body should be captured");
+        assert!(
+            responses_body.get("input").is_some(),
+            "responses probe must use Responses input shape"
+        );
+        assert!(
+            responses_body.get("messages").is_none(),
+            "responses probe must not send chat/messages payload"
+        );
+
+        let messages_body = captured_messages.lock().unwrap();
+        let messages_body = messages_body
+            .as_ref()
+            .expect("messages probe request body should be captured");
+        assert!(
+            messages_body.get("messages").is_some(),
+            "anthropic probe must send messages payload"
+        );
+        assert!(
+            messages_body.get("max_tokens").is_some(),
+            "anthropic probe must send max_tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_openai_chat_sends_chat_completions_shape() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let captured_chat = Arc::new(std::sync::Mutex::new(None));
+        let captured_chat_clone = Arc::clone(&captured_chat);
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                *captured_chat_clone.lock().unwrap() = Some(body);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl_probe",
+                    "model": "gpt-probe",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role":"assistant","content":"ok"},
+                        "finish_reason": "stop"
+                    }]
+                }))
+            })
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let state = Arc::new(build_state_with_single_target(&mock.uri(), "auto", Some("k1")).await);
+        let route = snapshot_route(state.as_ref(), "codex-main", None)
+            .await
+            .unwrap();
+        let target = route.targets.first().unwrap();
+        let resolved = resolve_target_protocol(state.as_ref(), target, Some("k1"))
+            .await
+            .unwrap();
+        assert_eq!(resolved.wire_api, WireApi::OpenAiChat);
+
+        let chat_body = captured_chat.lock().unwrap();
+        let chat_body = chat_body
+            .as_ref()
+            .expect("chat probe request body should be captured");
+        assert!(
+            chat_body.get("messages").is_some(),
+            "chat probe must send messages payload"
+        );
+        assert!(
+            chat_body.get("max_tokens").is_some(),
+            "chat probe must send max_tokens"
+        );
+        assert!(
+            chat_body.get("input").is_none(),
+            "chat probe must not use Responses input field"
+        );
     }
 
     #[tokio::test]
@@ -3673,7 +4718,9 @@ mod tests {
             .await;
 
         let state = Arc::new(build_state_with_single_target(&mock.uri(), "auto", Some("k1")).await);
-        let route = snapshot_route(state.as_ref(), "codex-main", None).unwrap();
+        let route = snapshot_route(state.as_ref(), "codex-main", None)
+            .await
+            .unwrap();
         let target = route.targets.first().unwrap();
         let error = resolve_target_protocol(state.as_ref(), target, Some("k1"))
             .await
@@ -3702,7 +4749,9 @@ mod tests {
 
         let state =
             Arc::new(build_state_with_single_target(&mock.uri(), "responses", Some("k1")).await);
-        let route = snapshot_route(state.as_ref(), "codex-main", None).unwrap();
+        let route = snapshot_route(state.as_ref(), "codex-main", None)
+            .await
+            .unwrap();
         let target = route.targets.first().unwrap();
 
         let resolved = resolve_target_protocol(state.as_ref(), target, Some("k1"))
@@ -3720,24 +4769,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_request_skips_auto_target_with_unknown_tool_support() {
+    async fn tool_request_runs_second_tool_probe_for_auto_target() {
         let first = MockServer::start().await;
         let second = MockServer::start().await;
 
-        // First target only receives text probe; actual tool-bearing request must be skipped.
+        // First target receives both text probe and tool probe for auto target.
+        let first_probe_bodies = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let first_probe_bodies_clone = Arc::clone(&first_probe_bodies);
         Mock::given(method("POST"))
             .and(path("/responses"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "resp_probe_only",
-                "model": "gpt-upstream-a",
-                "output": [{
-                    "type": "message",
-                    "id": "msg_probe_only",
-                    "role": "assistant",
-                    "content": [{"type":"output_text","text":"ok"}]
-                }]
-            })))
-            .expect(1)
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                first_probe_bodies_clone.lock().unwrap().push(body);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "resp_probe_only",
+                    "model": "gpt-upstream-a",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_probe_only",
+                        "role": "assistant",
+                        "content": [{"type":"output_text","text":"ok"}]
+                    }]
+                }))
+            })
+            .expect(2..=3)
             .mount(&first)
             .await;
 
@@ -3761,14 +4816,16 @@ mod tests {
                     }]
                 }))
             })
-            .expect(1)
+            .expect(0..=1)
             .mount(&second)
             .await;
 
         let mut state = build_state_with_two_targets(&first.uri(), &second.uri(), "auto").await;
         state.config.routes[0].targets[1].wire_api = "responses".to_string();
         let state = Arc::new(state);
-        let route = snapshot_route(state.as_ref(), "codex-main", None).unwrap();
+        let route = snapshot_route(state.as_ref(), "codex-main", None)
+            .await
+            .unwrap();
         assert_eq!(route.targets.len(), 2);
 
         let raw = serde_json::json!({
@@ -3788,7 +4845,7 @@ mod tests {
 
         let response = relay_non_streaming_response_scoped(
             Arc::clone(&state),
-            "req_tool_skip_unknown_support".to_string(),
+            "req_tool_second_probe_auto".to_string(),
             raw,
             Some("Bearer mw_key".to_string()),
             None,
@@ -3796,18 +4853,29 @@ mod tests {
             None,
         )
         .await
-        .expect("second target should satisfy tool-bearing request");
+        .expect("auto target should satisfy tool-bearing request after second tool probe");
 
-        let has_function_call = response
+        let has_message = response
             .output
             .iter()
-            .any(|item| matches!(item, DownstreamOutputItem::FunctionCall { .. }));
-        assert!(has_function_call);
+            .any(|item| matches!(item, DownstreamOutputItem::Message { .. }));
+        assert!(has_message);
 
-        // Ensure the second target really received tools (no stripping).
-        let tools = captured_tools.lock().unwrap();
-        let tools = tools.as_ref().expect("tools should be captured");
-        assert!(tools.as_array().is_some_and(|items| !items.is_empty()));
+        let probe_bodies = first_probe_bodies.lock().unwrap();
+        assert!(
+            probe_bodies.len() >= 2,
+            "text probe + tool probe should both run (plus optional real call)"
+        );
+        assert!(
+            probe_bodies.iter().any(|body| body.get("tools").is_some()),
+            "one probe request must include tools payload"
+        );
+
+        // If fallback happened, second target must receive tools; otherwise first target handled it.
+        let captured_tools_guard = captured_tools.lock().unwrap();
+        if let Some(tools) = captured_tools_guard.as_ref() {
+            assert!(tools.as_array().is_some_and(|items| !items.is_empty()));
+        }
     }
 
     #[tokio::test]
@@ -3837,7 +4905,9 @@ mod tests {
             .await;
 
         let state = Arc::new(build_state_with_single_target(&mock.uri(), "auto", Some("k1")).await);
-        let route = snapshot_route(state.as_ref(), "codex-main", None).unwrap();
+        let route = snapshot_route(state.as_ref(), "codex-main", None)
+            .await
+            .unwrap();
         let target = route.targets.first().unwrap().clone();
 
         let (first, second) = tokio::join!(
@@ -4465,6 +5535,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_guard_cjk_text_is_not_underestimated() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let mut state =
+            build_state_with_single_target(&upstream.uri(), "responses", Some("k1")).await;
+        state.config.routes[0].targets[0].context_window_tokens = Some(10_000);
+        state.config.routes[0].targets[0].context_safety_margin_tokens = Some(500);
+        let state = Arc::new(state);
+
+        let request = serde_json::json!({
+            "model":"codex-main",
+            "input":"你好".repeat(6_000)
+        });
+        let error = relay_non_streaming_response(
+            Arc::clone(&state),
+            "req_ctx_cjk".to_string(),
+            request,
+            Some("Bearer mw_k1".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::ContextLengthExceeded);
+    }
+
+    #[tokio::test]
+    async fn requested_max_output_above_target_limit_rejected_or_explicitly_clamped() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let mut state =
+            build_state_with_single_target(&upstream.uri(), "responses", Some("k1")).await;
+        state.config.routes[0].targets[0].context_window_tokens = Some(100_000);
+        state.config.routes[0].targets[0].max_output_tokens = Some(512);
+        let state = Arc::new(state);
+
+        let request = serde_json::json!({
+            "model":"codex-main",
+            "input":"hello",
+            "max_output_tokens": 4096
+        });
+        let error = relay_non_streaming_response(
+            Arc::clone(&state),
+            "req_ctx_max_output".to_string(),
+            request,
+            Some("Bearer mw_k1".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::ContextLengthExceeded);
+        assert!(
+            error.message.contains("Requested max_output_tokens"),
+            "error should explain max_output_tokens limit mismatch"
+        );
+    }
+
+    #[tokio::test]
     async fn no_silent_truncation() {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
@@ -4859,16 +5996,16 @@ mod tests {
             "relay should succeed with visible_only archive"
         );
 
-        let mut archives = Vec::new();
-        for entry in std::fs::read_dir(archive_root.path()).unwrap() {
-            let entry = entry.unwrap();
-            if entry.path().is_dir() {
-                archives.push(entry.path());
-            }
-        }
-        assert_eq!(archives.len(), 1, "one archive directory should be created");
-
-        let archive_dir = &archives[0];
+        let archive_dir = first_archive_dir_from_root(archive_root.path()).unwrap_or_else(|| {
+            panic!(
+                "archive directory should exist under {} ; found entries: {:?}",
+                archive_root.path().display(),
+                std::fs::read_dir(archive_root.path()).ok().map(|it| {
+                    it.filter_map(|e| e.ok().map(|de| de.path().display().to_string()))
+                        .collect::<Vec<_>>()
+                })
+            )
+        });
         let manifest_path = archive_dir.join("manifest.json");
         assert!(manifest_path.exists(), "manifest should be written");
         let manifest: serde_json::Value =
@@ -4959,10 +6096,7 @@ mod tests {
             "relay should succeed with metadata_only archive"
         );
 
-        let archive_dir = std::fs::read_dir(archive_root.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .find(|path| path.is_dir())
+        let archive_dir = first_archive_dir_from_root(archive_root.path())
             .expect("archive directory should exist");
         let manifest_path = archive_dir.join("manifest.json");
         let manifest: serde_json::Value =
@@ -5032,10 +6166,7 @@ mod tests {
             "relay should succeed with full_visible archive"
         );
 
-        let archive_dir = std::fs::read_dir(archive_root.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .find(|path| path.is_dir())
+        let archive_dir = first_archive_dir_from_root(archive_root.path())
             .expect("archive directory should exist");
         let manifest_path = archive_dir.join("manifest.json");
         let manifest: serde_json::Value =
@@ -5113,10 +6244,7 @@ mod tests {
             "relay should succeed with override capture mode"
         );
 
-        let archive_dir = std::fs::read_dir(archive_root.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .find(|path| path.is_dir())
+        let archive_dir = first_archive_dir_from_root(archive_root.path())
             .expect("archive directory should exist");
         let manifest_path = archive_dir.join("manifest.json");
         let manifest: serde_json::Value =
@@ -5193,12 +6321,22 @@ mod tests {
         wire_api: &str,
         provider_api_key: Option<&str>,
     ) -> ServerState {
+        let relay_secret = "test-relay-secret";
         let config = Config {
             server: ServerConfig {
                 upstream_timeout_secs: 5,
                 ..Default::default()
             },
-            security: SecurityConfig::default(),
+            security: SecurityConfig {
+                downstream_auth: "relay_key".to_string(),
+                log_secret: Some(relay_secret.to_string()),
+                relay_keys: vec![RelayKeyConfig {
+                    key_hash: hash_key_for_logging("mw_k1", relay_secret),
+                    enabled: true,
+                    ..RelayKeyConfig::default()
+                }],
+                ..SecurityConfig::default()
+            },
             archive: ArchiveConfig::default(),
             providers: vec![ProviderConfig {
                 id: "provider-a".to_string(),
@@ -5243,7 +6381,7 @@ mod tests {
             probe_locks: dashmap::DashMap::new(),
             key_limiter_counters: dashmap::DashMap::new(),
             ip_limiter_counters: dashmap::DashMap::new(),
-            archive_writer: tokio::sync::Mutex::new(None),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -5252,12 +6390,22 @@ mod tests {
         second_base_url: &str,
         wire_api: &str,
     ) -> ServerState {
+        let relay_secret = "test-relay-secret";
         let config = Config {
             server: ServerConfig {
                 upstream_timeout_secs: 5,
                 ..Default::default()
             },
-            security: SecurityConfig::default(),
+            security: SecurityConfig {
+                downstream_auth: "relay_key".to_string(),
+                log_secret: Some(relay_secret.to_string()),
+                relay_keys: vec![RelayKeyConfig {
+                    key_hash: hash_key_for_logging("mw_k1", relay_secret),
+                    enabled: true,
+                    ..RelayKeyConfig::default()
+                }],
+                ..SecurityConfig::default()
+            },
             archive: ArchiveConfig::default(),
             providers: vec![
                 ProviderConfig {
@@ -5332,7 +6480,7 @@ mod tests {
             probe_locks: dashmap::DashMap::new(),
             key_limiter_counters: dashmap::DashMap::new(),
             ip_limiter_counters: dashmap::DashMap::new(),
-            archive_writer: tokio::sync::Mutex::new(None),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -5389,12 +6537,22 @@ mod tests {
         first_base_url: &str,
         second_base_url: &str,
     ) -> ServerState {
+        let relay_secret = "test-relay-secret";
         let config = Config {
             server: ServerConfig {
                 upstream_timeout_secs: 5,
                 ..Default::default()
             },
-            security: SecurityConfig::default(),
+            security: SecurityConfig {
+                downstream_auth: "relay_key".to_string(),
+                log_secret: Some(relay_secret.to_string()),
+                relay_keys: vec![RelayKeyConfig {
+                    key_hash: hash_key_for_logging("mw_k1", relay_secret),
+                    enabled: true,
+                    ..RelayKeyConfig::default()
+                }],
+                ..SecurityConfig::default()
+            },
             archive: ArchiveConfig::default(),
             providers: vec![
                 ProviderConfig {
@@ -5453,7 +6611,7 @@ mod tests {
             probe_locks: dashmap::DashMap::new(),
             key_limiter_counters: dashmap::DashMap::new(),
             ip_limiter_counters: dashmap::DashMap::new(),
-            archive_writer: tokio::sync::Mutex::new(None),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -5461,12 +6619,22 @@ mod tests {
         first_base_url: &str,
         second_base_url: &str,
     ) -> ServerState {
+        let relay_secret = "test-relay-secret";
         let config = Config {
             server: ServerConfig {
                 upstream_timeout_secs: 5,
                 ..Default::default()
             },
-            security: SecurityConfig::default(),
+            security: SecurityConfig {
+                downstream_auth: "relay_key".to_string(),
+                log_secret: Some(relay_secret.to_string()),
+                relay_keys: vec![RelayKeyConfig {
+                    key_hash: hash_key_for_logging("mw_k1", relay_secret),
+                    enabled: true,
+                    ..RelayKeyConfig::default()
+                }],
+                ..SecurityConfig::default()
+            },
             archive: ArchiveConfig::default(),
             providers: vec![
                 ProviderConfig {
@@ -5541,7 +6709,7 @@ mod tests {
             probe_locks: dashmap::DashMap::new(),
             key_limiter_counters: dashmap::DashMap::new(),
             ip_limiter_counters: dashmap::DashMap::new(),
-            archive_writer: tokio::sync::Mutex::new(None),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -5551,6 +6719,44 @@ mod tests {
             bytes.extend_from_slice(frame);
         }
         String::from_utf8(bytes).unwrap_or_default()
+    }
+
+    fn first_archive_dir_from_root(root: &std::path::Path) -> Option<std::path::PathBuf> {
+        fn has_manifest(path: &std::path::Path) -> bool {
+            path.join("manifest.json").is_file()
+        }
+
+        let level1 = std::fs::read_dir(root).ok()?;
+        for entry1 in level1.filter_map(|entry| entry.ok().map(|e| e.path())) {
+            if !entry1.is_dir() {
+                continue;
+            }
+            if has_manifest(&entry1) {
+                return Some(entry1);
+            }
+            for entry2 in std::fs::read_dir(&entry1)
+                .ok()
+                .into_iter()
+                .flat_map(|entries| entries.filter_map(|entry| entry.ok().map(|e| e.path())))
+            {
+                if !entry2.is_dir() {
+                    continue;
+                }
+                if has_manifest(&entry2) {
+                    return Some(entry2);
+                }
+                for entry3 in std::fs::read_dir(&entry2)
+                    .ok()
+                    .into_iter()
+                    .flat_map(|entries| entries.filter_map(|entry| entry.ok().map(|e| e.path())))
+                {
+                    if entry3.is_dir() && has_manifest(&entry3) {
+                        return Some(entry3);
+                    }
+                }
+            }
+        }
+        None
     }
 
     async fn seed_previous_response_state(

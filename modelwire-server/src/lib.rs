@@ -9,6 +9,8 @@ pub mod middleware;
 pub mod relay;
 pub mod request_limiter;
 pub mod routes;
+pub mod runtime_config;
+pub mod secrets;
 pub mod server;
 
 pub use janitor::{run_janitor_periodically, CleanupReport, Janitor};
@@ -17,6 +19,7 @@ pub use server::*;
 
 use modelwire_archive::writer::ArchiveWriter;
 use modelwire_core as core;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -61,6 +64,6 @@ pub struct ServerState {
     pub probe_locks: dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     pub key_limiter_counters: dashmap::DashMap<String, KeyLimiterCounters>,
     pub ip_limiter_counters: dashmap::DashMap<String, KeyRateLimitState>,
-    /// Archive writer for conversation recording (lazily initialized).
-    pub archive_writer: tokio::sync::Mutex<Option<ArchiveWriter>>,
+    /// Archive writers keyed by root + mode + year-month period (lazily initialized).
+    pub archive_writers: tokio::sync::Mutex<HashMap<String, ArchiveWriter>>,
 }

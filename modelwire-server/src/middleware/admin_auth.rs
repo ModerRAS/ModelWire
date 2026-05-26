@@ -104,6 +104,13 @@ fn is_state_changing_method(method: &Method) -> bool {
 }
 
 fn is_csrf_valid(headers: &HeaderMap) -> bool {
+    let session_cookie = extract_cookie(headers, ADMIN_COOKIE_NAME);
+    // Bearer-authenticated non-browser clients may not use cookie sessions.
+    // Enforce CSRF only when a session cookie is present.
+    if session_cookie.is_none() {
+        return true;
+    }
+
     let csrf_header = headers
         .get(ADMIN_CSRF_HEADER_NAME)
         .and_then(|value| value.to_str().ok());
@@ -111,13 +118,9 @@ fn is_csrf_valid(headers: &HeaderMap) -> bool {
         return false;
     };
     let csrf_cookie = extract_cookie(headers, ADMIN_CSRF_COOKIE_NAME);
-    let session_cookie = extract_cookie(headers, ADMIN_COOKIE_NAME);
     let Some(csrf_cookie) = csrf_cookie else {
         return false;
     };
-    if session_cookie.is_none() {
-        return false;
-    }
     constant_time_equal(csrf_header.as_bytes(), csrf_cookie.as_bytes())
 }
 

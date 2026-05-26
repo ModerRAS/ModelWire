@@ -15,27 +15,41 @@ use tracing::{error, info};
 
 use crate::{
     error::error_response_to_response,
-    middleware::auth::DownstreamAuthContext,
+    middleware::{auth::DownstreamAuthContext, request_id::RequestIdExt},
     relay::{
         relay_compact_response_scoped, relay_non_streaming_response_scoped,
-        relay_streaming_response_scoped,
+        relay_streaming_response_stream_scoped,
     },
+    runtime_config::ensure_operational_config_seeded,
     ServerState,
 };
 use modelwire_core::error::{Error, ErrorKind};
+use modelwire_db::repo::{
+    routes::get_route as get_route_row, routes::get_targets as get_targets_row,
+};
 
 /// POST /v1/responses - Create a model response.
 pub async fn create_response(
     State(state): State<Arc<ServerState>>,
     request: Request<Body>,
 ) -> Response {
+    if let Err(error) = ensure_operational_config_seeded(state.as_ref()).await {
+        return error_response_to_response(error.to_response());
+    }
+
     let auth_context = request.extensions().get::<DownstreamAuthContext>().cloned();
     let request_id = request
-        .headers()
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
+        .extensions()
+        .get::<RequestIdExt>()
+        .map(|ext| ext.get_id().to_string())
+        .or_else(|| {
+            request
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(modelwire_core::generate_request_id);
     let downstream_authorization = request
         .headers()
         .get(AUTHORIZATION)
@@ -66,7 +80,7 @@ pub async fn create_response(
         return forbidden;
     }
     if let Some(forbidden) =
-        deny_if_provider_scope_not_satisfiable(&state, &raw_json, auth_context.as_ref())
+        deny_if_provider_scope_not_satisfiable(&state, &raw_json, auth_context.as_ref()).await
     {
         return forbidden;
     }
@@ -92,7 +106,7 @@ pub async fn create_response(
     let downstream_key_hash = auth_context.as_ref().and_then(|ctx| ctx.key_hash.clone());
 
     if stream {
-        match relay_streaming_response_scoped(
+        match relay_streaming_response_stream_scoped(
             Arc::clone(&state),
             request_id,
             raw_json,
@@ -101,22 +115,16 @@ pub async fn create_response(
         )
         .await
         {
-            Ok(result) => {
-                let mut all = Vec::new();
-                for frame in result.sse_frames {
-                    all.extend_from_slice(&frame);
-                }
-                (
-                    axum::http::StatusCode::OK,
-                    [
-                        ("content-type", "text/event-stream"),
-                        ("cache-control", "no-cache"),
-                        ("connection", "keep-alive"),
-                    ],
-                    all,
-                )
-                    .into_response()
-            }
+            Ok(stream_body) => (
+                axum::http::StatusCode::OK,
+                [
+                    ("content-type", "text/event-stream"),
+                    ("cache-control", "no-cache"),
+                    ("connection", "keep-alive"),
+                ],
+                Body::from_stream(stream_body),
+            )
+                .into_response(),
             Err(error) => error_response_to_response(error.to_response()),
         }
     } else {
@@ -142,13 +150,23 @@ pub async fn compact_response(
     State(state): State<Arc<ServerState>>,
     request: Request<Body>,
 ) -> Response {
+    if let Err(error) = ensure_operational_config_seeded(state.as_ref()).await {
+        return error_response_to_response(error.to_response());
+    }
+
     let auth_context = request.extensions().get::<DownstreamAuthContext>().cloned();
     let request_id = request
-        .headers()
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
+        .extensions()
+        .get::<RequestIdExt>()
+        .map(|ext| ext.get_id().to_string())
+        .or_else(|| {
+            request
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(modelwire_core::generate_request_id);
     let downstream_authorization = request
         .headers()
         .get(AUTHORIZATION)
@@ -179,7 +197,7 @@ pub async fn compact_response(
         return forbidden;
     }
     if let Some(forbidden) =
-        deny_if_provider_scope_not_satisfiable(&state, &raw_json, auth_context.as_ref())
+        deny_if_provider_scope_not_satisfiable(&state, &raw_json, auth_context.as_ref()).await
     {
         return forbidden;
     }
@@ -256,7 +274,7 @@ fn is_length_limit_error(error: &axum::Error) -> bool {
     false
 }
 
-fn deny_if_provider_scope_not_satisfiable(
+async fn deny_if_provider_scope_not_satisfiable(
     state: &ServerState,
     raw_json: &serde_json::Value,
     auth_context: Option<&DownstreamAuthContext>,
@@ -266,11 +284,14 @@ fn deny_if_provider_scope_not_satisfiable(
         .get("model")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)?;
-    let route = state.config.get_route(&model)?;
-    let route_has_allowed_provider = route.targets.iter().any(|target| {
+    let route = get_route_row(&state.db, &model).await.ok().flatten()?;
+    let targets = get_targets_row(&state.db, &route.id)
+        .await
+        .unwrap_or_default();
+    let route_has_allowed_provider = targets.iter().any(|target| {
         allowed_providers
             .iter()
-            .any(|provider| provider == &target.provider)
+            .any(|provider| provider == &target.provider_id)
     });
 
     if route_has_allowed_provider {
@@ -298,12 +319,13 @@ mod tests {
     use axum::{body::Body, http::Request};
     use modelwire_core::error::ErrorResponse;
     use modelwire_core::{
-        ArchiveConfig, Config, ProviderConfig, RouteConfig, SecurityConfig, ServerConfig,
-        TargetConfig,
+        hash_key_for_logging, ArchiveConfig, Config, ProviderConfig, RelayKeyConfig, RouteConfig,
+        SecurityConfig, ServerConfig, TargetConfig,
     };
     use modelwire_db::repo::responses::{
         get_latest_upstream_handle, get_response, store_response_metadata, ResponseInsert,
     };
+    use modelwire_db::repo::responses::{store_response_item, ResponseItemInsert};
     use modelwire_db::Database;
     use std::sync::Arc;
     use tower::util::ServiceExt;
@@ -630,6 +652,11 @@ mod tests {
             .await
             .unwrap()
             .expect("response shell should be persisted");
+        assert!(
+            persisted.request_id.starts_with("req_mw_"),
+            "data-plane handler should use middleware-generated request IDs when x-request-id is absent"
+        );
+        assert_ne!(persisted.request_id, "unknown");
         assert_eq!(persisted.downstream_model, "codex-main");
         assert_eq!(persisted.provider_id.as_deref(), Some("provider-a"));
         assert_eq!(persisted.upstream_model.as_deref(), Some("gpt-upstream"));
@@ -693,6 +720,109 @@ mod tests {
                 .get("content-type")
                 .and_then(|v| v.to_str().ok()),
             Some("text/event-stream")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_response_and_input_items_endpoints_return_persisted_state() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_upstream_get_1",
+                "model": "gpt-upstream",
+                "output": [ {
+                    "type":"message",
+                    "id":"msg_get_1",
+                    "role":"assistant",
+                    "content":[{"type":"output_text","text":"hello from upstream"}]
+                }],
+                "usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(build_state(&upstream.uri()).await);
+        let app = build_router(Arc::clone(&state));
+
+        let create = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": "codex-main",
+                    "input": "hello"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let created = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(created.status(), axum::http::StatusCode::OK);
+        let created_body = axum::body::to_bytes(created.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let created_json: serde_json::Value = serde_json::from_slice(&created_body).unwrap();
+        let response_id = created_json["id"].as_str().unwrap().to_string();
+
+        store_response_item(
+            &state.db,
+            &ResponseItemInsert {
+                id: "call_get_1",
+                response_id: &response_id,
+                sequence: 1,
+                item_type: "function_call",
+                role: None,
+                call_id: Some("call_get_1"),
+                content_json: r#"{"name":"lookup","arguments":"{\"q\":\"hello\"}"}"#,
+                visible: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let get_response_req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/responses/{response_id}"))
+            .header("authorization", "Bearer mw_key")
+            .body(Body::empty())
+            .unwrap();
+        let get_response = app.clone().oneshot(get_response_req).await.unwrap();
+        assert_eq!(get_response.status(), axum::http::StatusCode::OK);
+        let get_response_body = axum::body::to_bytes(get_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let get_response_json: serde_json::Value =
+            serde_json::from_slice(&get_response_body).unwrap();
+        assert_eq!(get_response_json["id"], response_id);
+        assert_eq!(get_response_json["object"], "response");
+        assert_eq!(get_response_json["model"], "codex-main");
+        assert!(get_response_json["output"].is_array());
+
+        let get_items_req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/responses/{response_id}/input_items"))
+            .header("authorization", "Bearer mw_key")
+            .body(Body::empty())
+            .unwrap();
+        let get_items = app.clone().oneshot(get_items_req).await.unwrap();
+        assert_eq!(get_items.status(), axum::http::StatusCode::OK);
+        let get_items_body = axum::body::to_bytes(get_items.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let get_items_json: serde_json::Value = serde_json::from_slice(&get_items_body).unwrap();
+        assert_eq!(get_items_json["object"], "list");
+        let data = get_items_json["data"].as_array().unwrap();
+        assert!(
+            data.iter().any(|item| item["type"] == "message"),
+            "input_items should include message items"
+        );
+        assert!(
+            data.iter().any(|item| item["type"] == "function_call"),
+            "input_items should include function_call items"
         );
     }
 
@@ -831,13 +961,31 @@ mod tests {
         build_state_with_wire_api(base_url, "responses").await
     }
 
+    fn default_relay_keys() -> Vec<RelayKeyConfig> {
+        default_relay_keys_for("mw_key")
+    }
+
+    fn default_relay_keys_for(raw_key: &str) -> Vec<RelayKeyConfig> {
+        let log_secret = "test-relay-secret";
+        vec![RelayKeyConfig {
+            key_hash: hash_key_for_logging(raw_key, log_secret),
+            enabled: true,
+            ..RelayKeyConfig::default()
+        }]
+    }
+
     async fn build_state_with_wire_api(base_url: &str, wire_api: &str) -> ServerState {
         let config = Config {
             server: ServerConfig {
                 upstream_timeout_secs: 5,
                 ..ServerConfig::default()
             },
-            security: SecurityConfig::default(),
+            security: SecurityConfig {
+                downstream_auth: "relay_key".to_string(),
+                log_secret: Some("test-relay-secret".to_string()),
+                relay_keys: default_relay_keys_for("mw_key"),
+                ..SecurityConfig::default()
+            },
             archive: ArchiveConfig::default(),
             providers: vec![ProviderConfig {
                 id: "provider-a".to_string(),
@@ -881,7 +1029,7 @@ mod tests {
             probe_locks: dashmap::DashMap::new(),
             key_limiter_counters: dashmap::DashMap::new(),
             ip_limiter_counters: dashmap::DashMap::new(),
-            archive_writer: tokio::sync::Mutex::new(None),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -894,7 +1042,12 @@ mod tests {
                 upstream_timeout_secs: 5,
                 ..ServerConfig::default()
             },
-            security: SecurityConfig::default(),
+            security: SecurityConfig {
+                downstream_auth: "relay_key".to_string(),
+                log_secret: Some("test-relay-secret".to_string()),
+                relay_keys: default_relay_keys(),
+                ..SecurityConfig::default()
+            },
             archive: ArchiveConfig::default(),
             providers: vec![
                 ProviderConfig {
@@ -952,7 +1105,7 @@ mod tests {
             probe_locks: dashmap::DashMap::new(),
             key_limiter_counters: dashmap::DashMap::new(),
             ip_limiter_counters: dashmap::DashMap::new(),
-            archive_writer: tokio::sync::Mutex::new(None),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1011,7 +1164,12 @@ mod tests {
     async fn build_test_state_for_v1_redirect(upstream_url: &str) -> ServerState {
         let config = Config {
             server: ServerConfig::default(),
-            security: SecurityConfig::default(),
+            security: SecurityConfig {
+                downstream_auth: "relay_key".to_string(),
+                log_secret: Some("test-relay-secret".to_string()),
+                relay_keys: default_relay_keys(),
+                ..SecurityConfig::default()
+            },
             archive: ArchiveConfig::default(),
             providers: vec![ProviderConfig {
                 id: "test-provider".to_string(),
@@ -1055,7 +1213,7 @@ mod tests {
             probe_locks: dashmap::DashMap::new(),
             key_limiter_counters: dashmap::DashMap::new(),
             ip_limiter_counters: dashmap::DashMap::new(),
-            archive_writer: tokio::sync::Mutex::new(None),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }

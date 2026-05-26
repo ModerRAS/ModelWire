@@ -31,5 +31,4 @@ jobs:
         with:
           crate: cargo-deny
       - name: Check licenses and policies
-        run: cargo deny check --workspace
-        continue-on-error: true  # Allow to run but report issues
+        run: cargo deny check

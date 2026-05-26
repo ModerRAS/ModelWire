@@ -92,6 +92,24 @@ impl UpstreamAdapter for OpenAiChatAdapter {
                         "content": output,
                     }));
                 }
+                modelwire_core::CanonicalInputItem::AssistantFunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                } => {
+                    messages.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": serde_json::Value::Null,
+                        "tool_calls": [{
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": arguments,
+                            }
+                        }]
+                    }));
+                }
             }
         }
 
@@ -146,7 +164,16 @@ impl UpstreamAdapter for OpenAiChatAdapter {
             body["top_p"] = serde_json::json!(top_p);
         }
 
-        debug!(body = %serde_json::to_string_pretty(&body).unwrap_or_default(), "Built Chat request");
+        debug!(
+            stream = canonical.stream,
+            messages = body
+                .get("messages")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| items.len())
+                .unwrap_or(0),
+            has_tools = !canonical.tools.is_empty(),
+            "Built Chat request"
+        );
 
         UpstreamRequest {
             method: "POST".to_string(),
@@ -306,23 +333,60 @@ impl UpstreamAdapter for OpenAiChatAdapter {
 
         match event_type {
             "[DONE]" => Ok(None),
-            "delta" | "chat_chunk" => {
+            "" | "delta" | "chat_chunk" => {
                 // Chat completions streaming format
-                let delta = json
-                    .get("delta")
-                    .ok_or_else(|| UpstreamError::InvalidResponse("missing delta".to_string()))?;
+                let (delta, index) = if let Some(choice) = json
+                    .get("choices")
+                    .and_then(|value| value.as_array())
+                    .and_then(|choices| choices.first())
+                {
+                    (
+                        choice.get("delta").ok_or_else(|| {
+                            UpstreamError::InvalidResponse("missing choices[0].delta".to_string())
+                        })?,
+                        choice
+                            .get("index")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0),
+                    )
+                } else {
+                    (
+                        json.get("delta").ok_or_else(|| {
+                            UpstreamError::InvalidResponse("missing delta".to_string())
+                        })?,
+                        json.get("index")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0),
+                    )
+                };
 
                 // Content delta
                 if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
-                    let item_id = json
-                        .get("index")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0)
-                        .to_string();
+                    let item_id = format!("chat_stream_item_{index}");
                     return Ok(Some(CanonicalEvent::OutputTextDelta {
                         item_id,
                         delta: content.to_string(),
                     }));
+                }
+
+                if let Some(tool_calls) = delta.get("tool_calls").and_then(|value| value.as_array())
+                {
+                    if let Some(tool_call) = tool_calls.first() {
+                        let tool_index = tool_call
+                            .get("index")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0);
+                        if let Some(arguments) = tool_call
+                            .get("function")
+                            .and_then(|function| function.get("arguments"))
+                            .and_then(|value| value.as_str())
+                        {
+                            return Ok(Some(CanonicalEvent::FunctionCallArgumentsDelta {
+                                item_id: format!("chat_stream_tool_{tool_index}"),
+                                delta: arguments.to_string(),
+                            }));
+                        }
+                    }
                 }
 
                 Ok(None)

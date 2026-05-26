@@ -63,8 +63,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         probe_locks: dashmap::DashMap::new(),
         key_limiter_counters: dashmap::DashMap::new(),
         ip_limiter_counters: dashmap::DashMap::new(),
-        archive_writer: tokio::sync::Mutex::new(None),
+        archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     });
+
+    modelwire_server::runtime_config::ensure_operational_config_seeded(state.as_ref())
+        .await
+        .map_err(|e| format!("Failed to seed runtime config: {}", e.message))?;
 
     // Spawn janitor task if running serve command
     if matches!(args.command.as_ref(), Some(Commands::Serve) | None) {
@@ -133,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::ExportConfig) => {
             // Export config (redacted)
-            let json = serde_json::to_string_pretty(&state.config)?;
+            let json = serde_json::to_string_pretty(&state.config.to_redacted_json())?;
             println!("{}", json);
         }
         Some(Commands::Migrate) => {

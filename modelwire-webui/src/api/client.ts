@@ -1,13 +1,70 @@
 import type { Provider, Route, Target, ProbeResult, Metrics, ConfigExport, PaginatedLogs } from '../types';
 
 const API_BASE = '/admin/api';
+const ADMIN_AUTH_STORAGE_KEY = 'modelwire_admin_auth_bearer';
+
+function getStoredAdminBearer(): string | null {
+  try {
+    return window.localStorage.getItem(ADMIN_AUTH_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function setStoredAdminBearer(token: string) {
+  try {
+    window.localStorage.setItem(ADMIN_AUTH_STORAGE_KEY, token);
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+function clearStoredAdminBearer() {
+  try {
+    window.localStorage.removeItem(ADMIN_AUTH_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+function getCookieValue(name: string): string | null {
+  if (typeof document === 'undefined') {
+    return null;
+  }
+  const cookieParts = document.cookie.split(';');
+  const needle = `${name}=`;
+  for (const part of cookieParts) {
+    const trimmed = part.trim();
+    if (trimmed.startsWith(needle)) {
+      return decodeURIComponent(trimmed.slice(needle.length));
+    }
+  }
+  return null;
+}
+
+function shouldAttachCsrfToken(method: string): boolean {
+  return method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
+}
 
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
+  const method = (options?.method ?? 'GET').toUpperCase();
+  const authToken = getStoredAdminBearer();
+  const csrfToken = shouldAttachCsrfToken(method) ? getCookieValue('admin_csrf') : null;
+  const baseHeaders: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (authToken) {
+    baseHeaders.Authorization = `Bearer ${authToken}`;
+  }
+  if (csrfToken) {
+    baseHeaders['x-csrf-token'] = csrfToken;
+  }
+
   const response = await fetch(url, {
     ...options,
     credentials: 'include',
     headers: {
-      'Content-Type': 'application/json',
+      ...baseHeaders,
       ...options?.headers,
     },
   });
@@ -108,26 +165,40 @@ export const configApi = {
 // Auth API
 export const authApi = {
   login: async (username: string, password: string) => {
-    const response = await fetch(`${API_BASE}/auth/login`, {
-      method: 'POST',
+    const bearer = password.trim();
+    if (!bearer) {
+      throw new Error('Password must not be empty');
+    }
+    setStoredAdminBearer(bearer);
+    const response = await fetch(`${API_BASE}/providers`, {
+      method: 'GET',
       credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password }),
+      headers: { Authorization: `Bearer ${bearer}` },
     });
     if (!response.ok) {
+      clearStoredAdminBearer();
       const error = await response.json().catch(() => ({ message: 'Login failed' }));
       throw new Error(error.message || `HTTP ${response.status}`);
     }
-    return response.json();
+    return { authenticated: true, username };
   },
   logout: async () => {
-    const response = await fetch(`${API_BASE}/auth/logout`, {
-      method: 'POST',
+    clearStoredAdminBearer();
+  },
+  check: async () => {
+    const bearer = getStoredAdminBearer();
+    if (!bearer) {
+      return { authenticated: false };
+    }
+    const response = await fetch(`${API_BASE}/providers`, {
+      method: 'GET',
       credentials: 'include',
+      headers: { Authorization: `Bearer ${bearer}` },
     });
     if (!response.ok) {
-      throw new Error('Logout failed');
+      clearStoredAdminBearer();
+      return { authenticated: false };
     }
+    return { authenticated: true };
   },
-  check: () => fetchJson<{ authenticated: boolean }>(`${API_BASE}/auth/check`),
 };

@@ -6,6 +6,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use crate::error::{error_response_to_response, ErrorKind};
@@ -45,9 +46,14 @@ pub async fn auth(
         return next.run(request).await;
     }
 
+    // Downstream auth applies only to data-plane `/v1` routes.
+    if path != "/v1" && !path.starts_with("/v1/") {
+        return next.run(request).await;
+    }
+
     if let Err(error) = enforce_ip_rate_limit(
         state.as_ref(),
-        &extract_client_identity(&request),
+        &extract_client_identity(state.as_ref(), &request),
         state.config.security.ip_requests_per_minute,
     ) {
         return error_response_to_response(error.to_response());
@@ -77,68 +83,79 @@ pub async fn auth(
             let relay_key = strip_bearer(auth_str).unwrap_or_default();
             let configured_keys = &state.config.security.relay_keys;
             if configured_keys.is_empty() {
+                return error_response_to_response(
+                    Error::new(
+                        ErrorKind::AuthFailed,
+                        "Relay key auth requires configured enabled relay keys",
+                    )
+                    .to_response(),
+                );
+            }
+
+            let has_enabled_keys = configured_keys.iter().any(|entry| entry.enabled);
+            if !has_enabled_keys {
                 let secret = state
                     .config
                     .security
                     .log_secret
                     .as_deref()
                     .unwrap_or("modelwire-default-relay-secret");
-                let key_hash = hash_key_for_logging(relay_key, secret);
-                request.extensions_mut().insert(DownstreamAuthContext {
-                    key_hash: Some(key_hash),
-                    allowed_models: None,
-                    allowed_providers: None,
-                    archive_capture_mode: None,
-                    limiter_slot_reserved: false,
-                });
+                let _ignored_key_hash = hash_key_for_logging(relay_key, secret);
+                return error_response_to_response(
+                    Error::new(
+                        ErrorKind::AuthFailed,
+                        "Relay key auth requires at least one enabled relay key",
+                    )
+                    .to_response(),
+                );
+            }
+
+            let secret = state
+                .config
+                .security
+                .log_secret
+                .as_deref()
+                .unwrap_or("modelwire-default-relay-secret");
+            let key_hash = hash_key_for_logging(relay_key, secret);
+            let Some(matched) = configured_keys
+                .iter()
+                .find(|entry| entry.enabled && entry.key_hash == key_hash)
+            else {
+                return error_response_to_response(
+                    Error::new(ErrorKind::AuthFailed, "Invalid relay key").to_response(),
+                );
+            };
+
+            let limiter_enforcement = match enforce_key_limits(
+                state.as_ref(),
+                &key_hash,
+                matched.requests_per_minute,
+                matched.max_concurrency,
+            ) {
+                Ok(value) => value,
+                Err(error) => return error_response_to_response(error.to_response()),
+            };
+
+            let allowed_models = if matched.allowed_models.is_empty() {
+                None
             } else {
-                let secret = state
-                    .config
-                    .security
-                    .log_secret
-                    .as_deref()
-                    .unwrap_or("modelwire-default-relay-secret");
-                let key_hash = hash_key_for_logging(relay_key, secret);
-                let Some(matched) = configured_keys
-                    .iter()
-                    .find(|entry| entry.enabled && entry.key_hash == key_hash)
-                else {
-                    return error_response_to_response(
-                        Error::new(ErrorKind::AuthFailed, "Invalid relay key").to_response(),
-                    );
-                };
+                Some(matched.allowed_models.clone())
+            };
+            let allowed_providers = if matched.allowed_providers.is_empty() {
+                None
+            } else {
+                Some(matched.allowed_providers.clone())
+            };
 
-                let limiter_enforcement = match enforce_key_limits(
-                    state.as_ref(),
-                    &key_hash,
-                    matched.requests_per_minute,
-                    matched.max_concurrency,
-                ) {
-                    Ok(value) => value,
-                    Err(error) => return error_response_to_response(error.to_response()),
-                };
-
-                let allowed_models = if matched.allowed_models.is_empty() {
-                    None
-                } else {
-                    Some(matched.allowed_models.clone())
-                };
-                let allowed_providers = if matched.allowed_providers.is_empty() {
-                    None
-                } else {
-                    Some(matched.allowed_providers.clone())
-                };
-
-                request.extensions_mut().insert(DownstreamAuthContext {
-                    key_hash: Some(key_hash.clone()),
-                    allowed_models,
-                    allowed_providers,
-                    archive_capture_mode: matched.archive_capture_mode.clone(),
-                    limiter_slot_reserved: limiter_enforcement.in_flight_reserved,
-                });
-                if limiter_enforcement.in_flight_reserved {
-                    limiter_release = Some(key_hash);
-                }
+            request.extensions_mut().insert(DownstreamAuthContext {
+                key_hash: Some(key_hash.clone()),
+                allowed_models,
+                allowed_providers,
+                archive_capture_mode: matched.archive_capture_mode.clone(),
+                limiter_slot_reserved: limiter_enforcement.in_flight_reserved,
+            });
+            if limiter_enforcement.in_flight_reserved {
+                limiter_release = Some(key_hash);
             }
         }
         "passthrough" | "trusted_passthrough" => {
@@ -197,8 +214,13 @@ pub async fn auth(
             }
         }
         "managed" => {
-            // API key managed by ModelWire
-            // Check that request is authorized
+            return error_response_to_response(
+                Error::new(
+                    ErrorKind::AuthFailed,
+                    "downstream_auth='managed' is not implemented yet",
+                )
+                .to_response(),
+            );
         }
         "none" => {
             // No auth (only for development!)
@@ -240,27 +262,48 @@ fn strip_bearer(value: &str) -> Option<&str> {
     value.strip_prefix("Bearer ")
 }
 
-fn extract_client_identity(request: &Request) -> String {
-    if let Some(forwarded_for) = request
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-    {
-        let first = forwarded_for.split(',').next().map(str::trim).unwrap_or("");
-        if !first.is_empty() {
-            return first.to_string();
+fn extract_client_identity(state: &ServerState, request: &Request) -> String {
+    let trust_forwarded = (state.config.security.trust_forwarded_ip_headers
+        || state.config.security.downstream_auth == "trusted_passthrough")
+        && is_request_from_trusted_proxy(request);
+    if trust_forwarded {
+        if let Some(forwarded_for) = request
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+        {
+            let first = forwarded_for.split(',').next().map(str::trim).unwrap_or("");
+            if !first.is_empty() {
+                return first.to_string();
+            }
         }
-    }
-    if let Some(real_ip) = request
-        .headers()
-        .get("x-real-ip")
-        .and_then(|value| value.to_str().ok())
-    {
-        if !real_ip.trim().is_empty() {
-            return real_ip.trim().to_string();
+        if let Some(real_ip) = request
+            .headers()
+            .get("x-real-ip")
+            .and_then(|value| value.to_str().ok())
+        {
+            if !real_ip.trim().is_empty() {
+                return real_ip.trim().to_string();
+            }
         }
     }
     "unknown".to_string()
+}
+
+fn is_request_from_trusted_proxy(request: &Request) -> bool {
+    request
+        .headers()
+        .get("x-modelwire-trusted-proxy")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false)
+        || request
+            .headers()
+            .get("x-modelwire-proxy-ip")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|raw| raw.parse::<IpAddr>().ok())
+            .map(|ip| !ip.is_loopback() && !ip.is_unspecified())
+            .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -370,7 +413,7 @@ mod tests {
             probe_locks: dashmap::DashMap::new(),
             key_limiter_counters: dashmap::DashMap::new(),
             ip_limiter_counters: dashmap::DashMap::new(),
-            archive_writer: tokio::sync::Mutex::new(None),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         });
         let app = build_router(Arc::clone(&state));
 
@@ -392,11 +435,8 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::OK);
 
         let archive_root = std::path::PathBuf::from(&state.config.archive.root);
-        let archive_dir = std::fs::read_dir(&archive_root)
-            .unwrap()
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .find(|path| path.is_dir())
-            .expect("archive directory should exist");
+        let archive_dir =
+            first_archive_dir_from_root(&archive_root).expect("archive directory should exist");
         let manifest_path = archive_dir.join("manifest.json");
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
@@ -404,5 +444,328 @@ mod tests {
             manifest["capture_mode"], "metadata_only",
             "relay key archive_capture_mode should override global archive.capture_mode"
         );
+    }
+
+    fn first_archive_dir_from_root(root: &std::path::Path) -> Option<std::path::PathBuf> {
+        fn find_manifest_dir(path: &std::path::Path, depth: usize) -> Option<std::path::PathBuf> {
+            if depth == 0 || !path.is_dir() {
+                return None;
+            }
+            if path.join("manifest.json").is_file() {
+                return Some(path.to_path_buf());
+            }
+            for child in std::fs::read_dir(path)
+                .ok()?
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+            {
+                if let Some(found) = find_manifest_dir(&child, depth - 1) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        find_manifest_dir(root, 4)
+    }
+
+    #[tokio::test]
+    async fn relay_key_empty_key_list_does_not_accept_any_mw_prefix() {
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/responses"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "resp_upstream_never_called",
+                    "model": "gpt-upstream",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_never_called",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "should not happen"}]
+                    }]
+                })),
+            )
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let config = Config {
+            server: ServerConfig {
+                upstream_timeout_secs: 5,
+                ..ServerConfig::default()
+            },
+            security: SecurityConfig {
+                downstream_auth: "relay_key".to_string(),
+                log_secret: Some("test-log-secret".to_string()),
+                relay_keys: vec![],
+                ..SecurityConfig::default()
+            },
+            archive: ArchiveConfig::default(),
+            providers: vec![ProviderConfig {
+                id: "provider-a".to_string(),
+                name: "Provider A".to_string(),
+                base_url: upstream.uri(),
+                auth_mode: "managed".to_string(),
+                default_wire_api: "responses".to_string(),
+                state_scope: Some("scope-a".to_string()),
+                api_key: Some("k1".to_string()),
+                allow_private_ips: false,
+                skip_ssrf_validation: true,
+                config_json: None,
+            }],
+            routes: vec![RouteConfig {
+                id: Some("route-a".to_string()),
+                downstream_model: "codex-main".to_string(),
+                description: None,
+                enabled: true,
+                targets: vec![TargetConfig {
+                    provider: "provider-a".to_string(),
+                    upstream_model: "gpt-upstream".to_string(),
+                    wire_api: "responses".to_string(),
+                    priority: 10,
+                    enabled: true,
+                    context_window_tokens: Some(100_000),
+                    max_output_tokens: None,
+                    auto_compact_recommended_tokens: None,
+                    context_safety_margin_tokens: Some(2_000),
+                    token_estimator: None,
+                    context_overflow_policy: "reject".to_string(),
+                    config_json: None,
+                }],
+            }],
+        };
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = Arc::new(ServerState {
+            config,
+            db,
+            probe_cache: dashmap::DashMap::new(),
+            probe_locks: dashmap::DashMap::new(),
+            key_limiter_counters: dashmap::DashMap::new(),
+            ip_limiter_counters: dashmap::DashMap::new(),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_anything")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model":"codex-main",
+                    "input":"auth should fail"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn managed_downstream_auth_requires_real_validation() {
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/responses"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "resp_upstream_never_called_managed",
+                    "model": "gpt-upstream",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_never_called_managed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "should not happen"}]
+                    }]
+                })),
+            )
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let config = Config {
+            server: ServerConfig {
+                upstream_timeout_secs: 5,
+                ..ServerConfig::default()
+            },
+            security: SecurityConfig {
+                downstream_auth: "managed".to_string(),
+                ..SecurityConfig::default()
+            },
+            archive: ArchiveConfig::default(),
+            providers: vec![ProviderConfig {
+                id: "provider-a".to_string(),
+                name: "Provider A".to_string(),
+                base_url: upstream.uri(),
+                auth_mode: "managed".to_string(),
+                default_wire_api: "responses".to_string(),
+                state_scope: Some("scope-a".to_string()),
+                api_key: Some("k1".to_string()),
+                allow_private_ips: false,
+                skip_ssrf_validation: true,
+                config_json: None,
+            }],
+            routes: vec![RouteConfig {
+                id: Some("route-a".to_string()),
+                downstream_model: "codex-main".to_string(),
+                description: None,
+                enabled: true,
+                targets: vec![TargetConfig {
+                    provider: "provider-a".to_string(),
+                    upstream_model: "gpt-upstream".to_string(),
+                    wire_api: "responses".to_string(),
+                    priority: 10,
+                    enabled: true,
+                    context_window_tokens: Some(100_000),
+                    max_output_tokens: None,
+                    auto_compact_recommended_tokens: None,
+                    context_safety_margin_tokens: Some(2_000),
+                    token_estimator: None,
+                    context_overflow_policy: "reject".to_string(),
+                    config_json: None,
+                }],
+            }],
+        };
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = Arc::new(ServerState {
+            config,
+            db,
+            probe_cache: dashmap::DashMap::new(),
+            probe_locks: dashmap::DashMap::new(),
+            key_limiter_counters: dashmap::DashMap::new(),
+            ip_limiter_counters: dashmap::DashMap::new(),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer anything")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model":"codex-main",
+                    "input":"managed auth should fail closed"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn trusted_passthrough_uses_forwarded_ip_for_rate_limit_identity() {
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/responses"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "resp_upstream_tp_ip",
+                    "model": "gpt-upstream",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_tp_ip",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "ok"}]
+                    }]
+                })),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let config = Config {
+            server: ServerConfig {
+                upstream_timeout_secs: 5,
+                ..ServerConfig::default()
+            },
+            security: SecurityConfig {
+                downstream_auth: "trusted_passthrough".to_string(),
+                allow_passthrough_keys: true,
+                trusted_passthrough_header: Some("x-gateway-token".to_string()),
+                trusted_passthrough_value: Some("gw-allow".to_string()),
+                ip_requests_per_minute: Some(1),
+                ..SecurityConfig::default()
+            },
+            archive: ArchiveConfig::default(),
+            providers: vec![ProviderConfig {
+                id: "provider-a".to_string(),
+                name: "Provider A".to_string(),
+                base_url: upstream.uri(),
+                auth_mode: "pass_authorization".to_string(),
+                default_wire_api: "responses".to_string(),
+                state_scope: Some("scope-a".to_string()),
+                api_key: None,
+                allow_private_ips: false,
+                skip_ssrf_validation: true,
+                config_json: None,
+            }],
+            routes: vec![RouteConfig {
+                id: Some("route-a".to_string()),
+                downstream_model: "codex-main".to_string(),
+                description: None,
+                enabled: true,
+                targets: vec![TargetConfig {
+                    provider: "provider-a".to_string(),
+                    upstream_model: "gpt-upstream".to_string(),
+                    wire_api: "responses".to_string(),
+                    priority: 10,
+                    enabled: true,
+                    context_window_tokens: Some(100_000),
+                    max_output_tokens: None,
+                    auto_compact_recommended_tokens: None,
+                    context_safety_margin_tokens: Some(2_000),
+                    token_estimator: None,
+                    context_overflow_policy: "reject".to_string(),
+                    config_json: None,
+                }],
+            }],
+        };
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = Arc::new(ServerState {
+            config,
+            db,
+            probe_cache: dashmap::DashMap::new(),
+            probe_locks: dashmap::DashMap::new(),
+            key_limiter_counters: dashmap::DashMap::new(),
+            ip_limiter_counters: dashmap::DashMap::new(),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        let app = build_router(Arc::clone(&state));
+
+        let req1 = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("x-gateway-token", "gw-allow")
+            .header("authorization", "Bearer upstream-key")
+            .header("x-forwarded-for", "203.0.113.10")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"model":"codex-main","input":"first"}).to_string(),
+            ))
+            .unwrap();
+        let res1 = app.clone().oneshot(req1).await.unwrap();
+        assert_eq!(res1.status(), axum::http::StatusCode::OK);
+
+        let req2 = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("x-gateway-token", "gw-allow")
+            .header("authorization", "Bearer upstream-key")
+            .header("x-forwarded-for", "203.0.113.10")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"model":"codex-main","input":"second"}).to_string(),
+            ))
+            .unwrap();
+        let res2 = app.oneshot(req2).await.unwrap();
+        assert_eq!(res2.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
     }
 }

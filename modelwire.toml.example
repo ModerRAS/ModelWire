@@ -37,6 +37,12 @@ data_dir = "/app/data"
 # Downstream authentication mode: "relay_key", "passthrough", or "none"
 # For public deployments, use "relay_key" with strong keys
 # downstream_auth = "relay_key"
+#
+# IMPORTANT: relay_key mode now requires at least one enabled relay key entry.
+# Example:
+# [[security.relay_keys]]
+# key_hash = "replace-with-hashed-key-prefix"
+# enabled = true
 
 # Set to true only if behind a secure network
 # allow_passthrough_keys = false

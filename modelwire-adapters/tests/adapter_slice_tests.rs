@@ -380,6 +380,56 @@ mod responses_adapter_tests {
     }
 
     #[test]
+    fn test_responses_build_request_with_assistant_function_call_replay_item() {
+        let adapter = ResponsesAdapter::new();
+        let mut canonical = basic_canonical_request();
+        canonical.input = vec![
+            CanonicalInputItem::AssistantFunctionCall {
+                call_id: "call_replay_1".to_string(),
+                name: "lookup_weather".to_string(),
+                arguments: "{\"city\":\"Boston\"}".to_string(),
+            },
+            CanonicalInputItem::FunctionCallOutput {
+                call_id: "call_replay_1".to_string(),
+                output: "{\"temperature\":72}".to_string(),
+            },
+        ];
+
+        let request = adapter.build_request(&canonical, "https://api.openai.com/v1", None);
+        let input = request
+            .body
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .expect("responses input should be an array");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["call_id"], "call_replay_1");
+        assert_eq!(input[0]["name"], "lookup_weather");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_replay_1");
+    }
+
+    #[test]
+    fn test_responses_build_request_with_single_function_call_output() {
+        let adapter = ResponsesAdapter::new();
+        let mut canonical = basic_canonical_request();
+        canonical.input = vec![CanonicalInputItem::FunctionCallOutput {
+            call_id: "call_replay_1".to_string(),
+            output: "{\"temperature\":72}".to_string(),
+        }];
+
+        let request = adapter.build_request(&canonical, "https://api.openai.com/v1", None);
+        let input = request
+            .body
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .expect("single non-text input should be serialized as an input array");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["call_id"], "call_replay_1");
+    }
+
+    #[test]
     fn test_responses_build_request_tool_choice_none() {
         let adapter = ResponsesAdapter::new();
         let mut canonical = basic_canonical_request();
@@ -537,6 +587,37 @@ mod anthropic_adapter_tests {
     }
 
     #[test]
+    fn test_anthropic_build_request_assistant_tool_use_before_tool_result() {
+        let adapter = AnthropicAdapter::new();
+        let mut canonical = basic_canonical_request();
+        canonical.input = vec![
+            CanonicalInputItem::AssistantFunctionCall {
+                call_id: "call_123".to_string(),
+                name: "lookup_weather".to_string(),
+                arguments: "{\"city\":\"Boston\"}".to_string(),
+            },
+            CanonicalInputItem::FunctionCallOutput {
+                call_id: "call_123".to_string(),
+                output: "{\"forecast\":\"sunny\"}".to_string(),
+            },
+        ];
+
+        let request = adapter.build_request(&canonical, "https://api.anthropic.com/v1", None);
+        let messages = request
+            .body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .expect("anthropic messages should be an array");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"][0]["type"], "tool_use");
+        assert_eq!(messages[0]["content"][0]["id"], "call_123");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[1]["content"][0]["tool_use_id"], "call_123");
+    }
+
+    #[test]
     fn test_anthropic_build_request_streaming() {
         let adapter = AnthropicAdapter::new();
         let mut canonical = basic_canonical_request();
@@ -660,6 +741,52 @@ mod anthropic_adapter_tests {
                 assert_eq!(delta, "Hello");
             }
             _ => panic!("Expected OutputTextDelta event"),
+        }
+    }
+
+    #[test]
+    fn test_openai_chat_parse_real_sse_choices_delta_without_event_name() {
+        let adapter = OpenAiChatAdapter::new();
+        let data = r#"{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#.as_bytes();
+
+        let event = adapter.parse_sse_event("", data).unwrap().unwrap();
+
+        match event {
+            modelwire_core::CanonicalEvent::OutputTextDelta { item_id, delta } => {
+                assert_eq!(item_id, "chat_stream_item_0");
+                assert_eq!(delta, "Hello");
+            }
+            _ => panic!("Expected OutputTextDelta event"),
+        }
+    }
+
+    #[test]
+    fn test_openai_chat_parse_real_sse_tool_call_arguments_delta() {
+        let adapter = OpenAiChatAdapter::new();
+        let data = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": { "arguments": "{\"city\"" }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+
+        let event = adapter
+            .parse_sse_event("", data.as_bytes())
+            .unwrap()
+            .unwrap();
+
+        match event {
+            modelwire_core::CanonicalEvent::FunctionCallArgumentsDelta { item_id, delta } => {
+                assert_eq!(item_id, "chat_stream_tool_0");
+                assert_eq!(delta, "{\"city\"");
+            }
+            _ => panic!("Expected FunctionCallArgumentsDelta event"),
         }
     }
 
@@ -833,6 +960,44 @@ mod openai_chat_adapter_tests {
         let msg = messages.last().unwrap();
         assert_eq!(msg["role"], "tool");
         assert_eq!(msg["tool_call_id"], "call_123");
+    }
+
+    #[test]
+    fn test_openai_chat_build_request_assistant_tool_call_before_tool_message() {
+        let adapter = OpenAiChatAdapter::new();
+        let mut canonical = basic_canonical_request();
+        canonical.input = vec![
+            CanonicalInputItem::AssistantFunctionCall {
+                call_id: "call_123".to_string(),
+                name: "lookup_weather".to_string(),
+                arguments: "{\"city\":\"Boston\"}".to_string(),
+            },
+            CanonicalInputItem::FunctionCallOutput {
+                call_id: "call_123".to_string(),
+                output: "{\"forecast\":\"sunny\"}".to_string(),
+            },
+        ];
+
+        let request = adapter.build_request(&canonical, "https://api.openai.com/v1", None);
+        let messages = request
+            .body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .expect("chat messages should be an array");
+        assert!(
+            messages.len() >= 2,
+            "chat request should include assistant tool call plus tool result"
+        );
+        let assistant_tool_call = &messages[messages.len() - 2];
+        let tool_result = &messages[messages.len() - 1];
+        assert_eq!(assistant_tool_call["role"], "assistant");
+        assert_eq!(assistant_tool_call["tool_calls"][0]["id"], "call_123");
+        assert_eq!(
+            assistant_tool_call["tool_calls"][0]["function"]["name"],
+            "lookup_weather"
+        );
+        assert_eq!(tool_result["role"], "tool");
+        assert_eq!(tool_result["tool_call_id"], "call_123");
     }
 
     #[test]
@@ -1029,7 +1194,7 @@ mod openai_chat_adapter_tests {
 
         match event {
             modelwire_core::CanonicalEvent::OutputTextDelta { item_id, delta } => {
-                assert_eq!(item_id, "0");
+                assert_eq!(item_id, "chat_stream_item_0");
                 assert_eq!(delta, "Hello");
             }
             _ => panic!("Expected OutputTextDelta event"),

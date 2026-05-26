@@ -8,14 +8,7 @@ target/
 
 # WebUI build
 modelwire-webui/node_modules/
-modelwire-webui/src/
-modelwire-webui/public/
-modelwire-webui/index.html
-modelwire-webui/package*.json
-modelwire-webui/tsconfig*.json
-modelwire-webui/vite.config.ts
-modelwire-webui/eslint.config.js
-modelwire-webui/README.md
+modelwire-webui/dist/
 
 # Development files
 .sisyphus/

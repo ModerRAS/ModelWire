@@ -24,6 +24,8 @@ fn set_owner_only_dir_permissions(_path: &std::path::Path) -> Result<(), Archive
 pub struct ArchiveWriter {
     root: String,
     capture_mode: super::manifest::CaptureMode,
+    period_key: String,
+    archive_prefix: String,
     current_segment: Option<SegmentWriter>,
     manifest: ArchiveManifest,
 }
@@ -43,25 +45,49 @@ impl ArchiveWriter {
         root: String,
         capture_mode: super::manifest::CaptureMode,
     ) -> Result<Self, ArchiveError> {
+        let period_key = chrono::Utc::now().format("%Y-%m").to_string();
         let archive_id = format!("arch_{}", uuid::Uuid::now_v7());
+        let archive_prefix = format!("archives/{period_key}/{archive_id}");
 
         // Ensure root directory exists
         fs::create_dir_all(&root).await?;
         set_owner_only_dir_permissions(std::path::Path::new(&root))?;
 
         // Create archive directory
-        let archive_dir = format!("{}/{}", root, archive_id);
+        let archive_dir = format!("{}/{}", root, archive_prefix);
         fs::create_dir_all(&archive_dir).await?;
         set_owner_only_dir_permissions(std::path::Path::new(&archive_dir))?;
 
-        let manifest = ArchiveManifest::new(archive_id.clone(), capture_mode);
+        let manifest = ArchiveManifest::new(archive_id, capture_mode);
 
         Ok(Self {
             root,
             capture_mode,
+            period_key,
+            archive_prefix,
             current_segment: None,
             manifest,
         })
+    }
+
+    pub fn capture_mode(&self) -> super::manifest::CaptureMode {
+        self.capture_mode
+    }
+
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    pub fn period_key(&self) -> &str {
+        &self.period_key
+    }
+
+    pub fn archive_id(&self) -> &str {
+        &self.manifest.archive_id
+    }
+
+    pub fn manifest(&self) -> &ArchiveManifest {
+        &self.manifest
     }
 
     /// Write a conversation record.
@@ -104,8 +130,8 @@ impl ArchiveWriter {
         let segment_index = self.manifest.files.len() + 1;
         let segment_name = format!("conversations-{:06}.jsonl.zst", segment_index);
         let temp_name = format!("conversations-{:06}.jsonl.tmp", segment_index);
-        let final_path = format!("{}/{}", self.manifest.archive_id, segment_name);
-        let temp_path = format!("{}/{}", self.manifest.archive_id, temp_name);
+        let final_path = format!("{}/{}", self.archive_prefix, segment_name);
+        let temp_path = format!("{}/{}", self.archive_prefix, temp_name);
         validate_archive_relative_path(&final_path)?;
         validate_archive_relative_path(&temp_path)?;
 
@@ -124,7 +150,7 @@ impl ArchiveWriter {
     }
 
     /// Close the current segment and update manifest.
-    pub async fn close_segment(&mut self) -> Result<(), ArchiveError> {
+    pub async fn close_segment(&mut self) -> Result<Option<ArchiveFile>, ArchiveError> {
         if let Some(segment) = self.current_segment.take() {
             if let Some(mut file) = segment.file {
                 file.flush().await?;
@@ -148,34 +174,36 @@ impl ArchiveWriter {
             let result = hasher.finalize();
             let checksum = format!("{:x}", result);
 
-            self.manifest.add_file(ArchiveFile {
+            let archive_file = ArchiveFile {
                 path: segment.final_path,
                 format: "conversation_jsonl_zstd".to_string(),
                 checksum,
                 conversation_count: Some(segment.conversation_count),
                 item_count: Some(segment.item_count),
-            });
+            };
+            self.manifest.add_file(archive_file.clone());
 
             // Persist manifest after each sealed segment so archives remain recoverable
             // even when the process keeps the writer open for future appends.
             let manifest_json = serde_json::to_string_pretty(&self.manifest)
                 .map_err(|e| ArchiveError::IoError(e.to_string()))?;
-            let manifest_path = format!("{}/{}/manifest.json", self.root, self.manifest.archive_id);
+            let manifest_path = format!("{}/{}/manifest.json", self.root, self.archive_prefix);
             fs::write(manifest_path, manifest_json).await?;
+            return Ok(Some(archive_file));
         }
 
-        Ok(())
+        Ok(None)
     }
 
     /// Finalize the archive.
     pub async fn finalize(mut self) -> Result<ArchiveManifest, ArchiveError> {
-        self.close_segment().await?;
+        let _ = self.close_segment().await?;
 
         // Write manifest
         let manifest_json = serde_json::to_string_pretty(&self.manifest)
             .map_err(|e| ArchiveError::IoError(e.to_string()))?;
 
-        let manifest_path = format!("{}/manifest.json", self.manifest.archive_id);
+        let manifest_path = format!("{}/manifest.json", self.archive_prefix);
         fs::write(format!("{}/{}", self.root, manifest_path), manifest_json).await?;
 
         info!(

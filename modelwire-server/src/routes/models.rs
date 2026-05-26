@@ -4,7 +4,9 @@ use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::runtime_config::ensure_operational_config_seeded;
 use crate::ServerState;
+use modelwire_db::repo::routes::{get_targets as get_targets_row, list_routes as list_route_rows};
 
 /// Model information.
 #[derive(Debug, Serialize, Deserialize)]
@@ -28,26 +30,47 @@ pub struct ModelsResponse {
 
 /// GET /v1/models - List available models.
 pub async fn list_models(state: State<Arc<ServerState>>) -> Json<ModelsResponse> {
-    let models: Vec<ModelInfo> = state
-        .config
-        .routes
-        .iter()
-        .filter(|r| r.enabled)
-        .map(|route| {
-            let targets = state.config.get_sorted_targets(route);
-            let context_window = targets.iter().filter_map(|t| t.context_window_tokens).min();
-            let max_output_tokens = targets.iter().filter_map(|t| t.max_output_tokens).min();
-
-            ModelInfo {
-                id: route.downstream_model.clone(),
-                object: "model".to_string(),
-                created: 1700000000, // Placeholder, could use route creation time
-                owned_by: "modelwire".to_string(),
-                context_window,
-                max_output_tokens,
-            }
-        })
-        .collect();
+    let _ = ensure_operational_config_seeded(state.as_ref()).await;
+    let route_rows = list_route_rows(&state.db).await.unwrap_or_default();
+    let mut models = Vec::new();
+    for route in route_rows {
+        if route.enabled == 0 {
+            continue;
+        }
+        let targets = get_targets_row(&state.db, &route.id)
+            .await
+            .unwrap_or_default();
+        let mut context_window: Option<u64> = None;
+        let mut max_output_tokens: Option<u64> = None;
+        for target in targets.into_iter().filter(|target| target.enabled != 0) {
+            let target_cfg = serde_json::from_str::<serde_json::Value>(&target.config_json)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let target_context_window = target_cfg
+                .get("context_window_tokens")
+                .and_then(serde_json::Value::as_u64);
+            let target_max_output = target_cfg
+                .get("max_output_tokens")
+                .and_then(serde_json::Value::as_u64);
+            context_window = match (context_window, target_context_window) {
+                (Some(current), Some(candidate)) => Some(current.min(candidate)),
+                (None, candidate) => candidate,
+                (current, None) => current,
+            };
+            max_output_tokens = match (max_output_tokens, target_max_output) {
+                (Some(current), Some(candidate)) => Some(current.min(candidate)),
+                (None, candidate) => candidate,
+                (current, None) => current,
+            };
+        }
+        models.push(ModelInfo {
+            id: route.downstream_model,
+            object: "model".to_string(),
+            created: 1700000000, // Placeholder, could use route creation time
+            owned_by: "modelwire".to_string(),
+            context_window,
+            max_output_tokens,
+        });
+    }
 
     Json(ModelsResponse {
         object: "list".to_string(),
@@ -60,7 +83,8 @@ mod tests {
     use super::*;
     use crate::ServerState;
     use modelwire_core::{
-        Config, ProviderConfig, RouteConfig, SecurityConfig, ServerConfig, TargetConfig,
+        hash_key_for_logging, Config, ProviderConfig, RelayKeyConfig, RouteConfig, SecurityConfig,
+        ServerConfig, TargetConfig,
     };
     use modelwire_db::Database;
     use std::sync::Arc;
@@ -97,7 +121,16 @@ mod tests {
     async fn build_state_with_context_targets() -> ServerState {
         let config = Config {
             server: ServerConfig::default(),
-            security: SecurityConfig::default(),
+            security: SecurityConfig {
+                downstream_auth: "relay_key".to_string(),
+                log_secret: Some("test-relay-secret".to_string()),
+                relay_keys: vec![RelayKeyConfig {
+                    key_hash: hash_key_for_logging("mw_test_key", "test-relay-secret"),
+                    enabled: true,
+                    ..RelayKeyConfig::default()
+                }],
+                ..SecurityConfig::default()
+            },
             archive: modelwire_core::ArchiveConfig::default(),
             providers: vec![
                 ProviderConfig {
@@ -172,7 +205,7 @@ mod tests {
             probe_locks: dashmap::DashMap::new(),
             key_limiter_counters: dashmap::DashMap::new(),
             ip_limiter_counters: dashmap::DashMap::new(),
-            archive_writer: tokio::sync::Mutex::new(None),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }

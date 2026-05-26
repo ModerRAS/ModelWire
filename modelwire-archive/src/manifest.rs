@@ -137,19 +137,32 @@ pub fn rebuild_archive_index_from_files(
         return Ok(Vec::new());
     }
 
+    fn collect_manifests(
+        dir: &std::path::Path,
+        out: &mut Vec<std::path::PathBuf>,
+    ) -> Result<(), ArchiveError> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                collect_manifests(&path, out)?;
+            } else if path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name == "manifest.json")
+                    .unwrap_or(false)
+            {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+
     let mut rebuilt = Vec::new();
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        let archive_dir = entry.path();
-        if !archive_dir.is_dir() {
-            continue;
-        }
-
-        let manifest_path = archive_dir.join("manifest.json");
-        if !manifest_path.is_file() {
-            continue;
-        }
-
+    let mut manifests = Vec::new();
+    collect_manifests(root, &mut manifests)?;
+    for manifest_path in manifests {
         let manifest_bytes = std::fs::read(&manifest_path)?;
         let manifest: ArchiveManifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|e| ArchiveError::IoError(e.to_string()))?;

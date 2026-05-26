@@ -110,6 +110,7 @@ CREATE TABLE IF NOT EXISTS probe_results (
     failure_message_redacted TEXT,
     last_success_at TEXT,
     last_failure_at TEXT,
+    created_at TEXT,
     expires_at TEXT NOT NULL,
     UNIQUE(provider_id, credential_hash, upstream_model)
 );
@@ -178,6 +179,21 @@ CREATE TABLE IF NOT EXISTS archive_files (
     manifest_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_archive_files_path_unique ON archive_files(path);
+
+-- Admin config audit events
+CREATE TABLE IF NOT EXISTS admin_audit_events (
+    id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    actor_key_hash TEXT NOT NULL,
+    action TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    diff_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_admin_audit_request_id ON admin_audit_events(request_id);
+CREATE INDEX IF NOT EXISTS idx_admin_audit_created_at ON admin_audit_events(created_at);
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_responses_request_id ON responses(request_id);
@@ -299,6 +315,7 @@ CREATE TABLE IF NOT EXISTS probe_results (
     failure_message_redacted TEXT,
     last_success_at TIMESTAMPTZ,
     last_failure_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ,
     expires_at TIMESTAMPTZ NOT NULL,
     UNIQUE(provider_id, credential_hash, upstream_model)
 );
@@ -367,6 +384,21 @@ CREATE TABLE IF NOT EXISTS archive_files (
     manifest_json JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_archive_files_path_unique ON archive_files(path);
+
+-- Admin config audit events
+CREATE TABLE IF NOT EXISTS admin_audit_events (
+    id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    actor_key_hash TEXT NOT NULL,
+    action TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    diff_json JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_admin_audit_request_id ON admin_audit_events(request_id);
+CREATE INDEX IF NOT EXISTS idx_admin_audit_created_at ON admin_audit_events(created_at);
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_responses_request_id ON responses(request_id);

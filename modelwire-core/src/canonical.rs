@@ -138,6 +138,16 @@ pub enum CanonicalInputItem {
         content: Vec<ContentBlock>,
     },
 
+    /// Assistant tool call replay item.
+    ///
+    /// Used when ModelWire materializes canonical history for cross-upstream
+    /// replay and needs to preserve assistant function call lineage.
+    AssistantFunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+
     /// Function call output (tool result).
     FunctionCallOutput { call_id: String, output: String },
 }

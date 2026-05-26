@@ -53,35 +53,14 @@ impl UpstreamAdapter for ResponsesAdapter {
         }
 
         // Add input
-        if canonical.input.len() == 1 {
-            if let modelwire_core::CanonicalInputItem::Text { ref content } = canonical.input[0] {
-                body["input"] = serde_json::json!(content);
-            }
-        } else {
-            let input_items: Vec<_> = canonical
+        if let [modelwire_core::CanonicalInputItem::Text { content }] = canonical.input.as_slice() {
+            body["input"] = serde_json::json!(content);
+        } else if !canonical.input.is_empty() {
+            body["input"] = serde_json::json!(canonical
                 .input
                 .iter()
-                .map(|item| match item {
-                    modelwire_core::CanonicalInputItem::Text { content } => {
-                        serde_json::json!({ "type": "text", "text": content })
-                    }
-                    modelwire_core::CanonicalInputItem::Message { role, content } => {
-                        serde_json::json!({
-                            "type": "message",
-                            "role": role,
-                            "content": content,
-                        })
-                    }
-                    modelwire_core::CanonicalInputItem::FunctionCallOutput { call_id, output } => {
-                        serde_json::json!({
-                            "type": "function_call_output",
-                            "call_id": call_id,
-                            "output": output,
-                        })
-                    }
-                })
-                .collect();
-            body["input"] = serde_json::json!(input_items);
+                .map(responses_input_item_json)
+                .collect::<Vec<_>>());
         }
 
         // Add previous_response_id if available
@@ -156,7 +135,13 @@ impl UpstreamAdapter for ResponsesAdapter {
             body["include"] = serde_json::json!(canonical.include);
         }
 
-        debug!(body = %serde_json::to_string_pretty(&body).unwrap_or_default(), "Built Responses request");
+        debug!(
+            stream = canonical.stream,
+            has_tools = !canonical.tools.is_empty(),
+            has_previous_response_id = canonical.previous_response_id.is_some(),
+            include_count = canonical.include.len(),
+            "Built Responses request"
+        );
 
         UpstreamRequest {
             method: "POST".to_string(),
@@ -506,6 +491,40 @@ impl ResponsesAdapter {
                 "Unknown item type: {}",
                 item_type
             ))),
+        }
+    }
+}
+
+fn responses_input_item_json(item: &modelwire_core::CanonicalInputItem) -> serde_json::Value {
+    match item {
+        modelwire_core::CanonicalInputItem::Text { content } => {
+            serde_json::json!({ "type": "text", "text": content })
+        }
+        modelwire_core::CanonicalInputItem::Message { role, content } => {
+            serde_json::json!({
+                "type": "message",
+                "role": role,
+                "content": content,
+            })
+        }
+        modelwire_core::CanonicalInputItem::FunctionCallOutput { call_id, output } => {
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            })
+        }
+        modelwire_core::CanonicalInputItem::AssistantFunctionCall {
+            call_id,
+            name,
+            arguments,
+        } => {
+            serde_json::json!({
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+            })
         }
     }
 }

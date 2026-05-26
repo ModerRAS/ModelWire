@@ -48,6 +48,28 @@ jobs:
       - name: Check feature flags
         run: cargo check --workspace --all-features
 
+  webui:
+    name: WebUI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: modelwire-webui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: modelwire-webui/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Build
+        run: npm run build
+      - name: Audit
+        run: npm audit --audit-level=high --registry=https://registry.npmjs.org
+
   security-audit:
     name: Security Audit
     runs-on: ubuntu-latest

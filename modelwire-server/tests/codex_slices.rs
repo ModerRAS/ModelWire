@@ -9,7 +9,8 @@
 
 use axum::{body::Body, http::Request};
 use modelwire_core::{
-    ArchiveConfig, Config, ProviderConfig, RouteConfig, SecurityConfig, ServerConfig, TargetConfig,
+    hash_key_for_logging, ArchiveConfig, Config, ProviderConfig, RelayKeyConfig, RouteConfig,
+    SecurityConfig, ServerConfig, TargetConfig,
 };
 use modelwire_db::Database;
 use modelwire_server::{server::build_router, ServerState};
@@ -708,12 +709,22 @@ mod codex_tool_loop_shell_like_tests {
 
 /// Build a test ServerState for slice tests.
 async fn build_test_state(upstream_base_url: &str) -> ServerState {
+    let relay_secret = "test-relay-secret";
     let config = Config {
         server: ServerConfig {
             upstream_timeout_secs: 5,
             ..ServerConfig::default()
         },
-        security: SecurityConfig::default(),
+        security: SecurityConfig {
+            downstream_auth: "relay_key".to_string(),
+            log_secret: Some(relay_secret.to_string()),
+            relay_keys: vec![RelayKeyConfig {
+                key_hash: hash_key_for_logging("mw_test_key", relay_secret),
+                enabled: true,
+                ..RelayKeyConfig::default()
+            }],
+            ..SecurityConfig::default()
+        },
         archive: ArchiveConfig::default(),
         providers: vec![ProviderConfig {
             id: "test-provider".to_string(),
@@ -759,6 +770,6 @@ async fn build_test_state(upstream_base_url: &str) -> ServerState {
         probe_locks: dashmap::DashMap::new(),
         key_limiter_counters: dashmap::DashMap::new(),
         ip_limiter_counters: dashmap::DashMap::new(),
-        archive_writer: tokio::sync::Mutex::new(None),
+        archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     }
 }

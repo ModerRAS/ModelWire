@@ -48,6 +48,7 @@ async fn build_public_state() -> ServerState {
             downstream_auth: "relay_key".to_string(),
             public_deployment: true,
             log_secret: Some(relay_secret.to_string()),
+            managed_key_encryption_secret: Some("test-managed-key-secret".to_string()),
             relay_keys: vec![
                 RelayKeyConfig {
                     key_hash: hash_key_for_logging("mw_valid_key", relay_secret),
@@ -89,10 +90,10 @@ async fn build_public_state() -> ServerState {
                 id: "provider-a".to_string(),
                 name: "Provider A".to_string(),
                 base_url: "https://api.example.com/v1".to_string(),
-                auth_mode: "pass_authorization".to_string(),
+                auth_mode: "managed".to_string(),
                 default_wire_api: "responses".to_string(),
                 state_scope: None,
-                api_key: None,
+                api_key: Some("managed-key-a".to_string()),
                 allow_private_ips: false,
                 skip_ssrf_validation: true, // Allow localhost URLs in tests
                 config_json: None,
@@ -101,10 +102,10 @@ async fn build_public_state() -> ServerState {
                 id: "provider-b".to_string(),
                 name: "Provider B".to_string(),
                 base_url: "https://api2.example.com/v1".to_string(),
-                auth_mode: "pass_authorization".to_string(),
+                auth_mode: "managed".to_string(),
                 default_wire_api: "responses".to_string(),
                 state_scope: None,
-                api_key: None,
+                api_key: Some("managed-key-b".to_string()),
                 allow_private_ips: false,
                 skip_ssrf_validation: true, // Allow localhost URLs in tests
                 config_json: None,
@@ -149,9 +150,6 @@ async fn build_public_state() -> ServerState {
     };
     let db = Database::connect("sqlite::memory:").await.unwrap();
     db.run_migrations().await.unwrap();
-    modelwire_db::repo::config_apply::replace_admin_config(&db, &config)
-        .await
-        .unwrap();
     ServerState {
         config,
         db,
@@ -159,7 +157,7 @@ async fn build_public_state() -> ServerState {
         probe_locks: dashmap::DashMap::new(),
         key_limiter_counters: dashmap::DashMap::new(),
         ip_limiter_counters: dashmap::DashMap::new(),
-        archive_writer: tokio::sync::Mutex::new(None),
+        archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     }
 }
 
@@ -173,6 +171,55 @@ async fn build_admin_secured_state() -> ServerState {
     state.config.security.admin_auth = "local_password".to_string();
     state.config.security.admin_password = Some(admin_hash);
     state
+}
+
+async fn assert_has_audit_event(
+    db: &Database,
+    action: &str,
+    resource_type: &str,
+    resource_id: &str,
+) {
+    let events = modelwire_db::repo::admin_audit::list_admin_audit_events(db, 100)
+        .await
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|event| {
+            event.action == action
+                && event.resource_type == resource_type
+                && event.resource_id == resource_id
+        })
+        .expect("expected admin audit event");
+    let diff: serde_json::Value = serde_json::from_str(&event.diff_json).unwrap_or_default();
+    let diff_str = diff.to_string();
+    assert!(
+        !diff_str.contains("sk-") && !diff_str.contains("Bearer "),
+        "audit diff should be redacted"
+    );
+}
+
+fn first_archive_manifest_under(root: &std::path::Path) -> serde_json::Value {
+    fn find_manifest_dir(path: &std::path::Path, depth: usize) -> Option<std::path::PathBuf> {
+        if depth == 0 || !path.is_dir() {
+            return None;
+        }
+        if path.join("manifest.json").is_file() {
+            return Some(path.to_path_buf());
+        }
+        for child in std::fs::read_dir(path)
+            .ok()?
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+        {
+            if let Some(found) = find_manifest_dir(&child, depth - 1) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    let archive_dir = find_manifest_dir(root, 4).expect("archive directory should exist");
+    let manifest_path = archive_dir.join("manifest.json");
+    serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap()
 }
 
 // ============================================================================
@@ -437,20 +484,179 @@ mod auth_and_anti_open_proxy {
     }
 
     #[tokio::test]
+    async fn pass_authorization_requires_passthrough_downstream_auth() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_should_not_be_called",
+                "model": "test-model",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_should_not_be_called",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "unexpected"}]
+                }]
+            })))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let relay_secret = "test-relay-secret";
+        let config = Config {
+            server: ServerConfig::default(),
+            security: SecurityConfig {
+                downstream_auth: "relay_key".to_string(),
+                public_deployment: true,
+                log_secret: Some(relay_secret.to_string()),
+                relay_keys: vec![RelayKeyConfig {
+                    key_hash: hash_key_for_logging("mw_passauth_block", relay_secret),
+                    enabled: true,
+                    allowed_models: vec!["test-model".to_string()],
+                    ..RelayKeyConfig::default()
+                }],
+                ..SecurityConfig::default()
+            },
+            archive: ArchiveConfig::default(),
+            providers: vec![ProviderConfig {
+                id: "test-provider".to_string(),
+                name: "Test Provider".to_string(),
+                base_url: upstream.uri(),
+                auth_mode: "pass_authorization".to_string(),
+                default_wire_api: "responses".to_string(),
+                state_scope: None,
+                api_key: None,
+                allow_private_ips: false,
+                skip_ssrf_validation: true,
+                config_json: None,
+            }],
+            routes: vec![RouteConfig {
+                id: Some("test-route".to_string()),
+                downstream_model: "test-model".to_string(),
+                description: None,
+                enabled: true,
+                targets: vec![TargetConfig {
+                    provider: "test-provider".to_string(),
+                    upstream_model: "test-model".to_string(),
+                    wire_api: "responses".to_string(),
+                    priority: 10,
+                    enabled: true,
+                    context_window_tokens: None,
+                    max_output_tokens: None,
+                    auto_compact_recommended_tokens: None,
+                    context_safety_margin_tokens: None,
+                    token_estimator: None,
+                    context_overflow_policy: "reject".to_string(),
+                    config_json: None,
+                }],
+            }],
+        };
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = Arc::new(ServerState {
+            config,
+            db,
+            probe_cache: dashmap::DashMap::new(),
+            probe_locks: dashmap::DashMap::new(),
+            key_limiter_counters: dashmap::DashMap::new(),
+            ip_limiter_counters: dashmap::DashMap::new(),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_passauth_block")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"test-model","input":"hello"}"#))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn relay_key_is_never_forwarded_as_upstream_authorization() {
+        let upstream = MockServer::start().await;
+        let captured_auth = Arc::new(std::sync::Mutex::new(None));
+        let captured_auth_clone = Arc::clone(&captured_auth);
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(move |req: &wiremock::Request| {
+                let auth = req.headers.iter().find_map(|(k, v)| {
+                    if k.as_str().eq_ignore_ascii_case("authorization") {
+                        Some(v.to_str().unwrap_or("").to_string())
+                    } else {
+                        None
+                    }
+                });
+                *captured_auth_clone.lock().unwrap() = auth;
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "resp_auth_forward_guard",
+                    "model": "test-model",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_auth_forward_guard",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "ok"}]
+                    }]
+                }))
+            })
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let mut state = build_public_state().await;
+        state.config.providers[0].base_url = upstream.uri();
+        state.config.providers[0].auth_mode = "managed".to_string();
+        state.config.providers[0].api_key = Some("managed-upstream-key".to_string());
+        let state = Arc::new(state);
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_key")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"test-model","input":"hello"}"#))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let auth = captured_auth
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("upstream request should include authorization");
+        assert_eq!(auth, "Bearer managed-upstream-key");
+        assert_ne!(auth, "Bearer mw_key");
+    }
+
+    #[tokio::test]
     async fn disabled_route_does_not_leak_model_existence() {
         // Create state with a disabled route
         let config = Config {
             server: ServerConfig::default(),
-            security: SecurityConfig::default(),
+            security: SecurityConfig {
+                downstream_auth: "relay_key".to_string(),
+                log_secret: Some("test-relay-secret".to_string()),
+                relay_keys: vec![RelayKeyConfig {
+                    key_hash: hash_key_for_logging("mw_valid_key", "test-relay-secret"),
+                    enabled: true,
+                    ..RelayKeyConfig::default()
+                }],
+                ..SecurityConfig::default()
+            },
             archive: ArchiveConfig::default(),
             providers: vec![ProviderConfig {
                 id: "test-provider".to_string(),
                 name: "Test Provider".to_string(),
                 base_url: "https://api.example.com/v1".to_string(),
-                auth_mode: "pass_authorization".to_string(),
+                auth_mode: "managed".to_string(),
                 default_wire_api: "responses".to_string(),
                 state_scope: None,
-                api_key: None,
+                api_key: Some("managed-key-disabled-route".to_string()),
                 allow_private_ips: false,
                 skip_ssrf_validation: true, // Allow localhost URLs in tests
                 config_json: None,
@@ -485,7 +691,7 @@ mod auth_and_anti_open_proxy {
             probe_locks: dashmap::DashMap::new(),
             key_limiter_counters: dashmap::DashMap::new(),
             ip_limiter_counters: dashmap::DashMap::new(),
-            archive_writer: tokio::sync::Mutex::new(None),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         });
         let app = build_router(Arc::clone(&state));
 
@@ -584,6 +790,7 @@ mod auth_and_anti_open_proxy {
         let mut state = build_public_state().await;
         state.config.providers[0].base_url = upstream.uri();
         state.config.security.ip_requests_per_minute = Some(1);
+        state.config.security.trust_forwarded_ip_headers = true;
         let state = Arc::new(state);
         let app = build_router(Arc::clone(&state));
 
@@ -591,6 +798,7 @@ mod auth_and_anti_open_proxy {
             .method("POST")
             .uri("/v1/responses")
             .header("authorization", "Bearer mw_key")
+            .header("x-modelwire-trusted-proxy", "true")
             .header("x-forwarded-for", "203.0.113.1")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"model": "test-model", "input": "hello"}"#))
@@ -602,6 +810,7 @@ mod auth_and_anti_open_proxy {
             .method("POST")
             .uri("/v1/responses")
             .header("authorization", "Bearer mw_key")
+            .header("x-modelwire-trusted-proxy", "true")
             .header("x-forwarded-for", "203.0.113.1")
             .header("content-type", "application/json")
             .body(Body::from(
@@ -616,6 +825,7 @@ mod auth_and_anti_open_proxy {
             .method("POST")
             .uri("/v1/responses")
             .header("authorization", "Bearer mw_key")
+            .header("x-modelwire-trusted-proxy", "true")
             .header("x-forwarded-for", "198.51.100.2")
             .header("content-type", "application/json")
             .body(Body::from(
@@ -624,6 +834,55 @@ mod auth_and_anti_open_proxy {
             .unwrap();
         let third_response = app.oneshot(third).await.unwrap();
         assert_eq!(third_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn untrusted_x_forwarded_for_does_not_bypass_ip_limit() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_up_ip_untrusted",
+                "model": "test-model",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_up_ip_untrusted",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }]
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let mut state = build_public_state().await;
+        state.config.providers[0].base_url = upstream.uri();
+        state.config.security.ip_requests_per_minute = Some(1);
+        state.config.security.trust_forwarded_ip_headers = true;
+        let state = Arc::new(state);
+        let app = build_router(Arc::clone(&state));
+
+        let first = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_key")
+            .header("x-forwarded-for", "203.0.113.7")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"test-model","input":"first"}"#))
+            .unwrap();
+        let first_response = app.clone().oneshot(first).await.unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+
+        let second = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_key")
+            .header("x-forwarded-for", "198.51.100.9")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"test-model","input":"second"}"#))
+            .unwrap();
+        let second_response = app.oneshot(second).await.unwrap();
+        assert_eq!(second_response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]
@@ -680,7 +939,7 @@ mod auth_and_anti_open_proxy {
             probe_locks: dashmap::DashMap::new(),
             key_limiter_counters: dashmap::DashMap::new(),
             ip_limiter_counters: dashmap::DashMap::new(),
-            archive_writer: tokio::sync::Mutex::new(None),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         });
         let app = build_router(Arc::clone(&state));
 
@@ -844,7 +1103,7 @@ mod auth_and_anti_open_proxy {
             probe_locks: dashmap::DashMap::new(),
             key_limiter_counters: dashmap::DashMap::new(),
             ip_limiter_counters: dashmap::DashMap::new(),
-            archive_writer: tokio::sync::Mutex::new(None),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         });
         let app = build_router(Arc::clone(&state));
 
@@ -946,6 +1205,7 @@ mod admin_security {
             .method("POST")
             .uri("/admin/api/providers")
             .header("authorization", "Bearer admin-test-password")
+            .header("cookie", "admin_session=session-csrf-only")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"name": "Test"}"#))
             .unwrap();
@@ -981,6 +1241,33 @@ mod admin_security {
     }
 
     #[tokio::test]
+    async fn admin_bearer_post_without_cookie_csrf_is_allowed() {
+        let state = Arc::new(build_admin_secured_state().await);
+        let app = build_router(Arc::clone(&state));
+
+        // Bearer-only admin clients (no session cookie) should not be blocked by CSRF.
+        // CSRF applies to cookie-authenticated browser flows.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/admin/api/providers")
+            .header("authorization", "Bearer admin-test-password")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "id":"bearer-no-cookie-provider",
+                    "name":"Bearer No Cookie",
+                    "base_url":"https://api.openai.com/v1",
+                    "auth_mode":"pass_authorization",
+                    "default_wire_api":"responses"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
     async fn public_bind_without_auth_fails_startup() {
         let config = Config {
             server: ServerConfig {
@@ -1005,7 +1292,7 @@ mod admin_security {
             probe_locks: dashmap::DashMap::new(),
             key_limiter_counters: dashmap::DashMap::new(),
             ip_limiter_counters: dashmap::DashMap::new(),
-            archive_writer: tokio::sync::Mutex::new(None),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         });
 
         let result = modelwire_server::server::serve(state).await;
@@ -1020,8 +1307,7 @@ mod admin_security {
         let rt = tokio::runtime::Runtime::new().expect("runtime should initialize");
         rt.block_on(async {
             let mut state = build_admin_secured_state().await;
-            state.config.server.public_base_url =
-                Some("https://modelwire.example.com".to_string());
+            state.config.server.public_base_url = Some("https://modelwire.example.com".to_string());
             state.config.providers = vec![ProviderConfig {
                 id: "secret-provider".to_string(),
                 name: "Secret Provider".to_string(),
@@ -1193,6 +1479,7 @@ mod admin_security {
         let imported_provider = imported_provider.unwrap();
         assert_eq!(imported_provider.base_url, "https://api.openai.com/v1");
         assert_eq!(imported_provider.default_wire_api, "responses");
+        assert_has_audit_event(&state.db, "config_import", "config", "runtime").await;
     }
 
     #[tokio::test]
@@ -1261,6 +1548,7 @@ mod admin_security {
         let from_db = from_db.unwrap();
         assert_eq!(from_db.name, "OK Provider");
         assert_eq!(from_db.base_url, "https://api.openai.com/v1");
+        assert_has_audit_event(&state.db, "provider_create", "provider", "ok-provider").await;
     }
 
     #[tokio::test]
@@ -1319,6 +1607,7 @@ mod admin_security {
             .unwrap();
         assert_eq!(updated.name, "Persist Provider Updated");
         assert_eq!(updated.base_url, "https://example.org/v1");
+        assert_has_audit_event(&state.db, "provider_update", "provider", "persist-provider").await;
 
         // delete provider
         let delete = Request::builder()
@@ -1528,6 +1817,9 @@ mod admin_security {
     async fn admin_route_crud_enforces_validation_and_not_found() {
         let mut state = build_admin_secured_state().await;
         state.config.server.public_base_url = Some("https://modelwire.example.com".to_string());
+        modelwire_db::repo::config_apply::replace_admin_config(&state.db, &state.config)
+            .await
+            .unwrap();
         let state = Arc::new(state);
         let app = build_router(Arc::clone(&state));
 
@@ -1737,6 +2029,9 @@ mod admin_security {
     async fn admin_target_crud_enforces_validation_and_not_found() {
         let mut state = build_admin_secured_state().await;
         state.config.server.public_base_url = Some("https://modelwire.example.com".to_string());
+        modelwire_db::repo::config_apply::replace_admin_config(&state.db, &state.config)
+            .await
+            .unwrap();
         let state = Arc::new(state);
         let app = build_router(Arc::clone(&state));
 
@@ -1916,6 +2211,9 @@ mod admin_security {
     async fn admin_target_priority_update_changes_db_order() {
         let mut state = build_admin_secured_state().await;
         state.config.server.public_base_url = Some("https://modelwire.example.com".to_string());
+        modelwire_db::repo::config_apply::replace_admin_config(&state.db, &state.config)
+            .await
+            .unwrap();
         let state = Arc::new(state);
         let app = build_router(Arc::clone(&state));
 
@@ -2371,177 +2669,80 @@ mod admin_security {
         assert_eq!(trusted_response.status(), StatusCode::OK);
     }
 
-    #[test]
-    fn admin_login_rate_limited() {
-        // Admin login attempts should be rate limited to prevent brute force attacks.
-        // This test verifies the rate limiting design for admin authentication.
+    #[tokio::test]
+    async fn admin_provider_create_writes_redacted_audit_event() {
+        let mut state = build_admin_secured_state().await;
+        state.config.server.public_base_url = Some("https://modelwire.example.com".to_string());
+        let state = Arc::new(state);
+        let app = build_router(Arc::clone(&state));
 
-        // Simulate rate limiting configuration
-        let rate_limit_config = json!({
-            "max_attempts": 5,
-            "window_seconds": 300,
-            "lockout_seconds": 900
-        });
-
-        // Verify rate limiting is configured
-        assert!(
-            rate_limit_config["max_attempts"].as_i64().unwrap() <= 10,
-            "Max attempts should be limited"
-        );
-        assert!(
-            rate_limit_config["window_seconds"].as_i64().unwrap() >= 60,
-            "Window should be at least 60s"
-        );
-        assert!(
-            rate_limit_config["lockout_seconds"].as_i64().unwrap() >= 300,
-            "Lockout should be at least 5min"
-        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/admin/api/providers")
+            .header("origin", "https://modelwire.example.com")
+            .header("authorization", "Bearer admin-test-password")
+            .header("x-csrf-token", "csrf-audit-1")
+            .header("cookie", "admin_session=sa1; admin_csrf=csrf-audit-1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "id":"audit-provider",
+                    "name":"Audit Provider",
+                    "base_url":"https://api.openai.com/v1",
+                    "auth_mode":"managed",
+                    "api_key":"sk-secret-should-not-appear",
+                    "default_wire_api":"responses"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_has_audit_event(&state.db, "provider_create", "provider", "audit-provider").await;
     }
 
-    #[test]
-    fn admin_logout_invalidates_session() {
-        // Admin logout should invalidate the session immediately.
-        // This test verifies session invalidation design.
+    #[tokio::test]
+    async fn admin_route_update_writes_redacted_audit_event() {
+        let mut state = build_admin_secured_state().await;
+        state.config.server.public_base_url = Some("https://modelwire.example.com".to_string());
+        modelwire_db::repo::config_apply::replace_admin_config(&state.db, &state.config)
+            .await
+            .unwrap();
+        let state = Arc::new(state);
+        let app = build_router(Arc::clone(&state));
 
-        // Simulate session state
-        let _session_before_logout = json!({
-            "session_id": "abc123",
-            "user": "admin",
-            "valid": true
-        });
+        let request = Request::builder()
+            .method("PATCH")
+            .uri("/admin/api/routes/test-route")
+            .header("origin", "https://modelwire.example.com")
+            .header("authorization", "Bearer admin-test-password")
+            .header("x-csrf-token", "csrf-audit-route-1")
+            .header(
+                "cookie",
+                "admin_session=sa-route-1; admin_csrf=csrf-audit-route-1",
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "description":"updated by audit test",
+                    "targets":[
+                        {
+                            "provider":"provider-a",
+                            "upstream_model":"test-model",
+                            "wire_api":"responses",
+                            "priority":10,
+                            "enabled":true,
+                            "context_overflow_policy":"reject"
+                        }
+                    ]
+                })
+                .to_string(),
+            ))
+            .unwrap();
 
-        // After logout, session should be invalid
-        let session_after_logout = json!({
-            "session_id": "abc123",
-            "user": "admin",
-            "valid": false,
-            "logout_time": "2024-01-01T00:00:00Z"
-        });
-
-        // Verify session was invalidated
-        assert!(
-            !session_after_logout["valid"].as_bool().unwrap(),
-            "Session should be invalid"
-        );
-        assert!(
-            session_after_logout.get("logout_time").is_some(),
-            "Logout time should be recorded"
-        );
-    }
-
-    #[test]
-    fn provider_error_escapes_html() {
-        // Provider error messages should be HTML-escaped to prevent XSS.
-        // When provider errors are displayed in the WebUI, they must not contain raw HTML.
-
-        let malicious_error = "<script>alert('xss')</script>";
-
-        // Simple HTML escaping function for this test
-        fn escape_html_simple(input: &str) -> String {
-            input
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-                .replace('"', "&quot;")
-                .replace('\'', "&#39;")
-        }
-
-        let escaped_error = escape_html_simple(malicious_error);
-
-        // Verify the escaped version doesn't contain script tags
-        assert!(
-            !escaped_error.contains("<script>"),
-            "Script tag should be escaped"
-        );
-        assert!(
-            !escaped_error.contains("<"),
-            "HTML characters should be escaped"
-        );
-    }
-
-    #[test]
-    fn config_change_writes_audit_log() {
-        // Configuration changes should write to an audit log.
-        // This test verifies the audit logging design.
-
-        // Simulate config change event
-        let audit_entry = json!({
-            "timestamp": "2024-01-01T00:00:00Z",
-            "action": "provider_create",
-            "actor": "admin@example.com",
-            "resource": "providers/test-provider",
-            "changes": {
-                "api_key": "[REDACTED]" // Secret should be redacted
-            }
-        });
-
-        // Verify audit log contains required fields
-        assert!(audit_entry.get("timestamp").is_some(), "Timestamp required");
-        assert!(audit_entry.get("action").is_some(), "Action required");
-        assert!(audit_entry.get("actor").is_some(), "Actor required");
-
-        // Verify secrets are redacted in audit log
-        let changes_str = serde_json::to_string(&audit_entry["changes"]).unwrap();
-        assert!(
-            !changes_str.contains("sk-"),
-            "API keys should be redacted in audit"
-        );
-    }
-
-    #[test]
-    fn hop_by_hop_headers_not_forwarded_upstream() {
-        // Hop-by-hop headers (Connection, Keep-Alive, etc.) should not be forwarded to upstream.
-        // This test verifies header filtering design.
-
-        let hop_by_hop_headers = vec![
-            "connection",
-            "keep-alive",
-            "proxy-authenticate",
-            "proxy-authorization",
-            "te",
-            "trailers",
-            "transfer-encoding",
-            "upgrade",
-        ];
-
-        // Verify these headers are in the block list
-        for header in hop_by_hop_headers {
-            let header_lower = header.to_lowercase();
-            // ModelWire should strip these headers before forwarding upstream
-            assert!(
-                header_lower == "connection"
-                    || header_lower == "keep-alive"
-                    || header_lower == "proxy-authenticate"
-                    || header_lower == "proxy-authorization"
-                    || header_lower == "te"
-                    || header_lower == "trailers"
-                    || header_lower == "transfer-encoding"
-                    || header_lower == "upgrade",
-                "Hop-by-hop header should be blocked: {}",
-                header
-            );
-        }
-    }
-
-    #[test]
-    fn admin_cookie_not_forwarded_upstream() {
-        // Admin session cookies should never be forwarded to upstream providers.
-        // This prevents cookie leakage to third-party APIs.
-
-        let admin_cookie_names = vec!["admin_session", "session_id", "admin_token", "csrftoken"];
-
-        // Verify these cookies are filtered before upstream requests
-        for cookie_name in admin_cookie_names {
-            // ModelWire should strip admin cookies when making upstream requests
-            assert!(
-                cookie_name.contains("admin")
-                    || cookie_name.contains("session")
-                    || cookie_name.contains("token")
-                    || cookie_name.contains("csrf"),
-                "Admin cookie should be filtered: {}",
-                cookie_name
-            );
-        }
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_has_audit_event(&state.db, "route_update", "route", "test-route").await;
     }
 
     #[test]
@@ -2576,7 +2777,10 @@ mod admin_security {
 
 mod ssrf_protection {
     use super::*;
-    use modelwire_core::ssrf::{validate_provider_url, validate_provider_url_for_provider};
+    use modelwire_core::ssrf::{
+        validate_provider_url, validate_provider_url_for_provider, validate_resolved_ip,
+    };
+    use std::net::IpAddr;
 
     #[test]
     fn provider_url_rejects_localhost_by_default() {
@@ -2660,6 +2864,35 @@ mod ssrf_protection {
             );
             assert!(!is_blocked, "HTTPS public URL should be allowed: {}", url);
         }
+    }
+
+    #[test]
+    fn provider_hostname_resolving_to_private_ip_rejected() {
+        // DNS-resolved private addresses must be blocked by default.
+        let resolved_private: IpAddr = "10.0.0.5".parse().unwrap();
+        let result = validate_resolved_ip(resolved_private, false);
+        assert!(
+            !matches!(result, modelwire_core::ssrf::SsrfValidationResult::Safe),
+            "resolved private IP should be rejected by SSRF policy"
+        );
+    }
+
+    #[test]
+    fn provider_hostname_dns_rebind_to_private_ip_rejected() {
+        // Simulate rebinding: first response is public, later response is private.
+        let first_public: IpAddr = "1.1.1.1".parse().unwrap();
+        let rebound_private: IpAddr = "192.168.1.10".parse().unwrap();
+        assert!(matches!(
+            validate_resolved_ip(first_public, false),
+            modelwire_core::ssrf::SsrfValidationResult::Safe
+        ));
+        assert!(
+            !matches!(
+                validate_resolved_ip(rebound_private, false),
+                modelwire_core::ssrf::SsrfValidationResult::Safe
+            ),
+            "rebound private IP should be rejected by SSRF policy"
+        );
     }
 
     #[test]
@@ -2940,6 +3173,10 @@ mod logging_and_archive {
         state.config.server.bind = "0.0.0.0:8787".to_string();
         state.config.archive.capture_mode = "debug_raw".to_string();
         state.config.archive.root = archive_root.path().to_string_lossy().to_string();
+        for target in &mut state.config.routes[0].targets {
+            target.context_window_tokens = Some(100_000);
+            target.context_safety_margin_tokens = Some(2_000);
+        }
         let state = Arc::new(state);
         let app = build_router(Arc::clone(&state));
 
@@ -3153,14 +3390,7 @@ mod logging_and_archive {
         assert_eq!(response.status(), StatusCode::OK);
 
         // Validate archive record exists and does not contain probe-only prompt text.
-        let archive_dir = std::fs::read_dir(archive_root.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .find(|path| path.is_dir())
-            .expect("archive directory should exist");
-        let manifest_path = archive_dir.join("manifest.json");
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let manifest = first_archive_manifest_under(archive_root.path());
         let segment_rel = manifest["files"][0]["path"]
             .as_str()
             .expect("segment path should exist");
@@ -3225,14 +3455,7 @@ mod logging_and_archive {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let archive_dir = std::fs::read_dir(archive_root.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .find(|path| path.is_dir())
-            .expect("archive directory should exist");
-        let manifest_path = archive_dir.join("manifest.json");
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let manifest = first_archive_manifest_under(archive_root.path());
         let segment_rel = manifest["files"][0]["path"]
             .as_str()
             .expect("segment path should exist");
@@ -3409,14 +3632,7 @@ mod logging_and_archive {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let archive_dir = std::fs::read_dir(archive_root.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .find(|path| path.is_dir())
-            .expect("archive directory should exist");
-        let manifest_path = archive_dir.join("manifest.json");
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let manifest = first_archive_manifest_under(archive_root.path());
         let segment_rel = manifest["files"][0]["path"]
             .as_str()
             .expect("segment path should exist");
@@ -3510,14 +3726,7 @@ mod logging_and_archive {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let archive_dir = std::fs::read_dir(archive_root.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .find(|path| path.is_dir())
-            .expect("archive directory should exist");
-        let manifest_path = archive_dir.join("manifest.json");
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let manifest = first_archive_manifest_under(archive_root.path());
         let segment_rel = manifest["files"][0]["path"]
             .as_str()
             .expect("segment path should exist");
@@ -3717,20 +3926,21 @@ mod deployment_hardening {
             "Dockerfile should start the server with an explicit config path"
         );
         assert!(
-            dockerfile.contains(r#"COPY modelwire-webui/ ./modelwire-webui/"#),
-            "Dockerfile should include the WebUI build context"
+            dockerfile.contains("FROM node:") && dockerfile.contains("npm run build"),
+            "Dockerfile should build the WebUI in a Node stage"
         );
         assert!(
             dockerfile.contains(
-                r#"COPY --from=builder /build/modelwire-webui/dist /app/modelwire-webui/dist"#
+                r#"COPY --from=webui-builder /build/modelwire-webui/dist /app/modelwire-webui/dist"#
             ),
             "Dockerfile should copy the WebUI dist into the runtime image"
         );
         let dockerignore = std::fs::read_to_string(workspace_root().join(".dockerignore"))
             .expect(".dockerignore should exist");
         assert!(
-            !dockerignore.contains("modelwire-webui/dist/"),
-            "Docker build context must include the built WebUI dist assets"
+            !dockerignore.contains("modelwire-webui/package*.json")
+                && !dockerignore.contains("modelwire-webui/src/"),
+            "Docker build context must include WebUI source and package manifests"
         );
     }
 
@@ -3888,7 +4098,16 @@ mod database_and_archive_protection {
             writer.write_conversation(&record).await.unwrap();
             let manifest = writer.finalize().await.unwrap();
 
-            let archive_dir = archive_root.join(&manifest.archive_id);
+            let first_segment_path = manifest
+                .files
+                .first()
+                .expect("manifest should include file")
+                .path
+                .clone();
+            let archive_dir_rel = std::path::Path::new(&first_segment_path)
+                .parent()
+                .expect("segment path should include archive directory");
+            let archive_dir = archive_root.join(archive_dir_rel);
             let root_mode = std::fs::metadata(&archive_root)
                 .expect("archive root should exist")
                 .permissions()
