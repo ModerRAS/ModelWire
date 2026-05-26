@@ -6,7 +6,11 @@ pub mod repo;
 pub mod schema;
 
 use crate::schema::{POSTGRES_SCHEMA, SQLITE_SCHEMA};
-use sqlx::{postgres::PgPoolOptions, sqlite::SqlitePoolOptions, PgPool, SqlitePool};
+use sqlx::{
+    postgres::PgPoolOptions,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    PgPool, SqlitePool,
+};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -93,19 +97,24 @@ impl DbPool {
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
         if database_url.starts_with("sqlite") {
             let sqlite_path = Self::sqlite_path_from_url(database_url);
-
-            let pool = SqlitePoolOptions::new()
-                .max_connections(5)
-                .acquire_timeout(Duration::from_secs(5))
-                .connect(database_url)
-                .await?;
-
-            if let Some(path) = sqlite_path {
+            if let Some(path) = sqlite_path.as_ref() {
                 if let Some(parent) = path.parent() {
                     if !parent.as_os_str().is_empty() {
                         Self::enforce_owner_only_permissions(parent, false)?;
                     }
                 }
+            }
+            let connect_options = SqliteConnectOptions::from_str(database_url)
+                .map_err(|e| sqlx::Error::Configuration(Box::new(e)))?
+                .create_if_missing(true);
+
+            let pool = SqlitePoolOptions::new()
+                .max_connections(5)
+                .acquire_timeout(Duration::from_secs(5))
+                .connect_with(connect_options)
+                .await?;
+
+            if let Some(path) = sqlite_path {
                 if path.exists() {
                     Self::enforce_owner_only_permissions(&path, true)?;
                 }

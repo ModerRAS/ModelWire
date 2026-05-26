@@ -1,6 +1,10 @@
-# ModelWire 严格完成度审查整改报告
+# ModelWire 严格完成度审查整改报告（历史记录）
 
 审查日期：2026-05-19
+
+> 2026-05-26 更新：本文件保留为历史审查记录，不再代表当前发布状态。
+> 其列出的多项 P0/P1 问题已在后续 hardening 中关闭；当前状态以
+> `docs/modelwire-implementation-plan.md` 的最新条目和 CI 结果为准。
 
 审查对象：
 
@@ -12,7 +16,10 @@
 
 ## 总结结论
 
-结论：**不能接受“已完成”的说法；不能视为 public-ready；不能按当前状态对外暴露。**
+历史结论（2026-05-19）：当时**不能接受“已完成”的说法；不能视为 public-ready；不能按当时状态对外暴露。**
+
+当前发布状态不要从本历史报告推断；请以最新 implementation plan 条目、
+CI 结果和 release checklist 为准。
 
 这个仓库已经有大量实现和不少有价值的 slice tests，但严格按
 `AGENTS.md` 和 `docs/modelwire-implementation-plan.md` 的验收纪律看，当前完成度存在明显断层：

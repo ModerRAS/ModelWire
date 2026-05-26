@@ -93,6 +93,19 @@ fn config_with_encrypted_managed_keys(
         .managed_key_encryption_secret
         .as_deref()
     else {
+        if let Some(provider) = config
+            .providers
+            .iter()
+            .find(|provider| provider.auth_mode == "managed" && provider.api_key.is_some())
+        {
+            return Err(Error::new(
+                ErrorKind::RequestInvalid,
+                format!(
+                    "managed provider '{}' defines api_key but security.managed_key_encryption_secret is not configured",
+                    provider.id
+                ),
+            ));
+        }
         return Ok(config);
     };
 
@@ -196,5 +209,63 @@ mod tests {
         assert!(encrypted.starts_with("mwenc:v1:"));
         let decrypted = crate::secrets::decrypt_managed_key(encrypted, secret).unwrap();
         assert_eq!(decrypted, "sk-seed-secret");
+    }
+
+    #[tokio::test]
+    async fn file_seed_rejects_plaintext_managed_key_without_encryption_secret() {
+        let config = Config {
+            server: ServerConfig::default(),
+            security: SecurityConfig::default(),
+            archive: ArchiveConfig::default(),
+            providers: vec![ProviderConfig {
+                id: "managed-provider".to_string(),
+                name: "Managed Provider".to_string(),
+                base_url: "https://api.example.com/v1".to_string(),
+                auth_mode: "managed".to_string(),
+                api_key: Some("sk-seed-secret".to_string()),
+                default_wire_api: "responses".to_string(),
+                state_scope: Some("scope-a".to_string()),
+                allow_private_ips: false,
+                skip_ssrf_validation: false,
+                config_json: None,
+            }],
+            routes: vec![RouteConfig {
+                id: Some("route-a".to_string()),
+                downstream_model: "codex-main".to_string(),
+                description: None,
+                enabled: true,
+                targets: vec![TargetConfig {
+                    provider: "managed-provider".to_string(),
+                    upstream_model: "gpt-upstream".to_string(),
+                    wire_api: "responses".to_string(),
+                    priority: 10,
+                    enabled: true,
+                    context_window_tokens: Some(128_000),
+                    max_output_tokens: Some(4096),
+                    auto_compact_recommended_tokens: None,
+                    context_safety_margin_tokens: Some(2_000),
+                    token_estimator: None,
+                    context_overflow_policy: "reject".to_string(),
+                    config_json: None,
+                }],
+            }],
+        };
+        let db = modelwire_db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        let state = ServerState {
+            config,
+            db,
+            probe_cache: dashmap::DashMap::new(),
+            probe_locks: dashmap::DashMap::new(),
+            key_limiter_counters: dashmap::DashMap::new(),
+            ip_limiter_counters: dashmap::DashMap::new(),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        };
+
+        let error = ensure_operational_config_seeded(&state).await.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::RequestInvalid);
+        assert!(error.message.contains("managed_key_encryption_secret"));
     }
 }

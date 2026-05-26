@@ -1,12 +1,40 @@
-target = "x86_64-unknown-linux-gnu"
+[graph]
+all-features = true
 
-[tool.cargo-deny]
+[advisories]
 version = 2
+yanked = "deny"
+ignore = [
+    # rsa is pulled into Cargo.lock through sqlx's optional mysql dependency graph,
+    # but ModelWire builds sqlx with mysql disabled.
+    "RUSTSEC-2023-0071",
+]
 
-[[tool.cargo-deny.lints]]
-name = "unreachable_pub"
-level = "warn"
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "AGPL-3.0-only",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
 
-[[tool.cargo-deny.lints]]
-name = "unused_qualifications"
-level = "allow"
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

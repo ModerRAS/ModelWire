@@ -282,9 +282,9 @@ mod codex_simple_text_stream_tests {
                  data: {\"response\":{\"id\":\"resp_upstream_stream\",\"model\":\"gpt-upstream\",\"created_at\":1234567890}}\n\n\
                  event: response.output_item.added\n\
                  data: {\"response_id\":\"resp_upstream_stream\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}\n\n\
-                 event: response.text.delta\n\
+                 event: response.output_text.delta\n\
                  data: {\"item_id\":\"msg_1\",\"delta\":{\"text\":\"Hello\"}}\n\n\
-                 event: response.text.delta\n\
+                 event: response.output_text.delta\n\
                  data: {\"item_id\":\"msg_1\",\"delta\":{\"text\":\" there!\"}}\n\n\
                  event: response.output_item.done\n\
                  data: {\"response_id\":\"resp_upstream_stream\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello there!\"}]}}\n\n\
@@ -346,7 +346,7 @@ mod codex_simple_text_stream_tests {
             "SSE should contain response.created event"
         );
         assert!(
-            body_str.contains("event: response.text.delta"),
+            body_str.contains("event: response.output_text.delta"),
             "SSE should contain text delta events"
         );
         assert!(
@@ -718,6 +718,7 @@ async fn build_test_state(upstream_base_url: &str) -> ServerState {
         security: SecurityConfig {
             downstream_auth: "relay_key".to_string(),
             log_secret: Some(relay_secret.to_string()),
+            managed_key_encryption_secret: Some("test-managed-key-secret".to_string()),
             relay_keys: vec![RelayKeyConfig {
                 key_hash: hash_key_for_logging("mw_test_key", relay_secret),
                 enabled: true,

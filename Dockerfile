@@ -14,7 +14,7 @@ RUN npm run build
 # =============================================================================
 # Stage 2: Build Rust server
 # =============================================================================
-FROM rust:1.79-bookworm AS builder
+FROM rust:1.95-bookworm AS builder
 
 WORKDIR /build
 

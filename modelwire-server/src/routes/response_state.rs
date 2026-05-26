@@ -182,6 +182,7 @@ fn items_to_output(items: Vec<ItemRecord>) -> Result<Vec<DownstreamOutputItem>, 
                 output.push(DownstreamOutputItem::FunctionCall {
                     id: item.id,
                     call_id: item.call_id.unwrap_or_default(),
+                    upstream_call_id: None,
                     name: payload
                         .get("name")
                         .and_then(serde_json::Value::as_str)
@@ -211,6 +212,33 @@ fn items_to_output(items: Vec<ItemRecord>) -> Result<Vec<DownstreamOutputItem>, 
 
 fn item_to_api_value(item: ItemRecord) -> serde_json::Value {
     match item.item_type.as_str() {
+        "input_message" => serde_json::json!({
+            "id": item.id,
+            "type": "message",
+            "role": item.role.unwrap_or_else(|| "user".to_string()),
+            "content": serde_json::from_str::<serde_json::Value>(&item.content_json).unwrap_or_else(|_| serde_json::json!([])),
+        }),
+        "function_call_output" => {
+            let payload: serde_json::Value =
+                serde_json::from_str(&item.content_json).unwrap_or_else(|_| serde_json::json!({}));
+            serde_json::json!({
+                "id": item.id,
+                "type": "function_call_output",
+                "call_id": item.call_id.unwrap_or_default(),
+                "output": payload.get("output").and_then(serde_json::Value::as_str).unwrap_or_default(),
+            })
+        }
+        "input_function_call" => {
+            let payload: serde_json::Value =
+                serde_json::from_str(&item.content_json).unwrap_or_else(|_| serde_json::json!({}));
+            serde_json::json!({
+                "id": item.id,
+                "type": "function_call",
+                "call_id": item.call_id.unwrap_or_default(),
+                "name": payload.get("name").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                "arguments": payload.get("arguments").and_then(serde_json::Value::as_str).unwrap_or("{}"),
+            })
+        }
         "message" => serde_json::json!({
             "id": item.id,
             "type": "message",

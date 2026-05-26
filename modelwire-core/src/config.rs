@@ -83,7 +83,7 @@ pub struct ServerConfig {
 }
 
 /// Archive configuration for conversation recording.
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ArchiveConfig {
     /// Capture mode: off, metadata_only, visible_only, full_visible, debug_raw.
     #[serde(default = "default_archive_capture_mode")]
@@ -96,6 +96,16 @@ pub struct ArchiveConfig {
     /// Whether to include upstream lineage in archives.
     #[serde(default = "default_true")]
     pub include_lineage: bool,
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        Self {
+            capture_mode: default_archive_capture_mode(),
+            root: default_archive_root(),
+            include_lineage: default_true(),
+        }
+    }
 }
 
 fn default_archive_capture_mode() -> String {
@@ -563,6 +573,14 @@ priority = 10
         assert_eq!(config.server.bind, "127.0.0.1:8787");
         assert_eq!(config.providers.len(), 1);
         assert_eq!(config.routes.len(), 1);
+    }
+
+    #[test]
+    fn test_config_archive_defaults_when_table_omitted() {
+        let config = Config::from_toml("").expect("empty config should use defaults");
+        assert_eq!(config.archive.capture_mode, "off");
+        assert_eq!(config.archive.root, "./archives");
+        assert!(config.archive.include_lineage);
     }
 
     #[test]

@@ -1,0 +1,5 @@
+[advisories]
+ignore = [
+    # rsa is present only through sqlx's optional mysql dependency graph.
+    "RUSTSEC-2023-0071",
+]

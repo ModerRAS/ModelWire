@@ -983,6 +983,7 @@ mod tests {
             security: SecurityConfig {
                 downstream_auth: "relay_key".to_string(),
                 log_secret: Some("test-relay-secret".to_string()),
+                managed_key_encryption_secret: Some("test-managed-key-secret".to_string()),
                 relay_keys: default_relay_keys_for("mw_key"),
                 ..SecurityConfig::default()
             },
@@ -1045,6 +1046,7 @@ mod tests {
             security: SecurityConfig {
                 downstream_auth: "relay_key".to_string(),
                 log_secret: Some("test-relay-secret".to_string()),
+                managed_key_encryption_secret: Some("test-managed-key-secret".to_string()),
                 relay_keys: default_relay_keys(),
                 ..SecurityConfig::default()
             },
@@ -1167,6 +1169,7 @@ mod tests {
             security: SecurityConfig {
                 downstream_auth: "relay_key".to_string(),
                 log_secret: Some("test-relay-secret".to_string()),
+                managed_key_encryption_secret: Some("test-managed-key-secret".to_string()),
                 relay_keys: default_relay_keys(),
                 ..SecurityConfig::default()
             },

@@ -376,13 +376,34 @@ impl UpstreamAdapter for OpenAiChatAdapter {
                             .get("index")
                             .and_then(|value| value.as_u64())
                             .unwrap_or(0);
+                        let item_id = format!("chat_stream_tool_{tool_index}");
+                        let call_id = tool_call
+                            .get("id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        let function = tool_call.get("function");
+                        let name = function
+                            .and_then(|function| function.get("name"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        if !call_id.is_empty() || !name.is_empty() {
+                            return Ok(Some(CanonicalEvent::OutputItemAdded {
+                                response_id: "".to_string(),
+                                item: modelwire_core::CanonicalOutputItem::FunctionCall {
+                                    id: item_id,
+                                    call_id: call_id.to_string(),
+                                    name: name.to_string(),
+                                    arguments: String::new(),
+                                },
+                            }));
+                        }
                         if let Some(arguments) = tool_call
                             .get("function")
                             .and_then(|function| function.get("arguments"))
                             .and_then(|value| value.as_str())
                         {
                             return Ok(Some(CanonicalEvent::FunctionCallArgumentsDelta {
-                                item_id: format!("chat_stream_tool_{tool_index}"),
+                                item_id,
                                 delta: arguments.to_string(),
                             }));
                         }

@@ -49,8 +49,7 @@ pub struct Janitor {
 impl Janitor {
     /// Build a SQLite placeholder list like "?,?,?" for `IN` clauses.
     fn sqlite_in_placeholders(count: usize) -> String {
-        std::iter::repeat("?")
-            .take(count)
+        std::iter::repeat_n("?", count)
             .collect::<Vec<_>>()
             .join(",")
     }

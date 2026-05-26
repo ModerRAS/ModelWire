@@ -29,8 +29,8 @@ impl SseEventType {
             "response.created" => SseEventType::ResponseCreated,
             "response.in_progress" => SseEventType::ResponseInProgress,
             "response.output_item.added" => SseEventType::ResponseOutputItemAdded,
-            "response.text.delta" => SseEventType::ResponseTextDelta,
-            "response.text.done" => SseEventType::ResponseTextDone,
+            "response.output_text.delta" | "response.text.delta" => SseEventType::ResponseTextDelta,
+            "response.output_text.done" | "response.text.done" => SseEventType::ResponseTextDone,
             "response.function_call_arguments.delta" => {
                 SseEventType::ResponseFunctionCallArgumentsDelta
             }
@@ -54,8 +54,8 @@ impl SseEventType {
             SseEventType::ResponseCreated => "response.created",
             SseEventType::ResponseInProgress => "response.in_progress",
             SseEventType::ResponseOutputItemAdded => "response.output_item.added",
-            SseEventType::ResponseTextDelta => "response.text.delta",
-            SseEventType::ResponseTextDone => "response.text.done",
+            SseEventType::ResponseTextDelta => "response.output_text.delta",
+            SseEventType::ResponseTextDone => "response.output_text.done",
             SseEventType::ResponseFunctionCallArgumentsDelta => {
                 "response.function_call_arguments.delta"
             }
@@ -138,11 +138,7 @@ pub fn extract_sse_frames(buffer: &mut BytesMut, chunk: &[u8]) -> Vec<RawSseFram
     buffer.extend_from_slice(chunk);
     let mut frames = Vec::new();
 
-    loop {
-        let Some((split_at, delimiter_len)) = find_frame_delimiter(buffer) else {
-            break;
-        };
-
+    while let Some((split_at, delimiter_len)) = find_frame_delimiter(buffer) {
         let mut frame_bytes = buffer.split_to(split_at + delimiter_len).to_vec();
         while frame_bytes.ends_with(b"\n") || frame_bytes.ends_with(b"\r") {
             frame_bytes.pop();
@@ -398,7 +394,7 @@ mod tests {
     #[test]
     fn test_extract_sse_frames_handles_utf8_split_chunks() {
         let mut buffer = BytesMut::new();
-        let first = b"event: response.text.delta\ndata: {\"delta\":{\"text\":\"\xE4\xBD";
+        let first = b"event: response.output_text.delta\ndata: {\"delta\":{\"text\":\"\xE4\xBD";
         let second = b"\xA0\xE5\xA5\xBD\"}}\n\n";
 
         let frames_first = extract_sse_frames(&mut buffer, first);
@@ -408,7 +404,7 @@ mod tests {
         assert_eq!(frames_second.len(), 1);
         assert_eq!(
             frames_second[0].event.as_deref(),
-            Some("response.text.delta")
+            Some("response.output_text.delta")
         );
         let json = String::from_utf8(frames_second[0].data.clone()).unwrap();
         assert!(json.contains("你好"));

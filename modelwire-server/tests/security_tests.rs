@@ -641,6 +641,7 @@ mod auth_and_anti_open_proxy {
             security: SecurityConfig {
                 downstream_auth: "relay_key".to_string(),
                 log_secret: Some("test-relay-secret".to_string()),
+                managed_key_encryption_secret: Some("test-managed-key-secret".to_string()),
                 relay_keys: vec![RelayKeyConfig {
                     key_hash: hash_key_for_logging("mw_valid_key", "test-relay-secret"),
                     enabled: true,
@@ -3562,6 +3563,56 @@ mod logging_and_archive {
         assert!(
             !body_text.contains(hidden_reasoning_text),
             "hidden reasoning text must not leak into downstream response payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_thinking_tags_not_exposed_as_assistant_text() {
+        let upstream = MockServer::start().await;
+        let hidden = "provider private thinking";
+
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_up_think_tags",
+                "model": "test-model",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_think_tags",
+                    "role": "assistant",
+                    "content": [{"type":"output_text","text": format!("<think>{hidden}</think>visible answer")}]
+                }]
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let mut state = build_public_state().await;
+        state.config.providers[0].base_url = upstream.uri();
+        let app = build_router(Arc::new(state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_key")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"test-model","input":"hello"}"#))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body_text = String::from_utf8_lossy(&body);
+
+        assert!(
+            body_text.contains("visible answer"),
+            "visible provider text should remain"
+        );
+        assert!(
+            !body_text.contains(hidden) && !body_text.contains("<think>"),
+            "provider thinking tags and contents must not appear as assistant output"
         );
     }
 

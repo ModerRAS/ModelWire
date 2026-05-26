@@ -351,6 +351,7 @@ mod tests {
             security: SecurityConfig {
                 downstream_auth: "relay_key".to_string(),
                 log_secret: Some(log_secret.to_string()),
+                managed_key_encryption_secret: Some("test-managed-key-secret".to_string()),
                 relay_keys: vec![RelayKeyConfig {
                     key_hash,
                     enabled: true,
@@ -496,6 +497,7 @@ mod tests {
             security: SecurityConfig {
                 downstream_auth: "relay_key".to_string(),
                 log_secret: Some("test-log-secret".to_string()),
+                managed_key_encryption_secret: Some("test-managed-key-secret".to_string()),
                 relay_keys: vec![],
                 ..SecurityConfig::default()
             },
@@ -592,6 +594,7 @@ mod tests {
             },
             security: SecurityConfig {
                 downstream_auth: "managed".to_string(),
+                managed_key_encryption_secret: Some("test-managed-key-secret".to_string()),
                 ..SecurityConfig::default()
             },
             archive: ArchiveConfig::default(),

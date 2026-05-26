@@ -84,6 +84,8 @@ struct NonStreamingAttemptContext<'a> {
 struct PersistHints<'a> {
     upstream_response_id: Option<&'a str>,
     previous_response_id: Option<&'a str>,
+    input: &'a [CanonicalInputItem],
+    status_override: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -104,6 +106,7 @@ struct ContinuationContext {
     previous_credential_hash: Option<String>,
     replay_items: Vec<CanonicalInputItem>,
     known_call_ids: HashSet<String>,
+    tool_call_id_map: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +196,8 @@ pub enum DownstreamOutputItem {
     FunctionCall {
         id: String,
         call_id: String,
+        #[serde(skip)]
+        upstream_call_id: Option<String>,
         name: String,
         arguments: String,
         status: &'static str,
@@ -300,10 +305,12 @@ pub async fn relay_non_streaming_response_scoped(
             &mut canonical,
             continuation.as_ref(),
             target,
+            target.configured_wire_api,
             downstream_authorization.as_deref(),
         )?;
 
-        match context_guard_check(target, &canonical) {
+        let context_canonical = canonical_for_context_guard(&canonical, continuation.as_ref());
+        match context_guard_check(target, &context_canonical) {
             Ok(()) => {}
             Err(error) if should_fallback_on_context_guard(target) => {
                 warn!(
@@ -501,10 +508,12 @@ pub async fn relay_streaming_response_stream_scoped(
             &mut canonical,
             continuation.as_ref(),
             target,
+            target.configured_wire_api,
             downstream_authorization.as_deref(),
         )?;
 
-        match context_guard_check(target, &canonical) {
+        let context_canonical = canonical_for_context_guard(&canonical, continuation.as_ref());
+        match context_guard_check(target, &context_canonical) {
             Ok(()) => {}
             Err(error) if should_fallback_on_context_guard(target) => {
                 warn!(
@@ -1036,6 +1045,10 @@ async fn try_target(
     if should_retry_with_replay_on_missing_handle(status.as_u16(), &bytes, &canonical) {
         let mut replay_canonical = canonical.clone();
         replay_canonical.previous_response_id = None;
+        if let Some(continuation) = attempt_context.continuation {
+            replay_canonical.input =
+                map_current_tool_outputs_to_downstream(&replay_canonical.input, continuation);
+        }
         let replay_input =
             replay_input_for_canonical(&replay_canonical, attempt_context.continuation);
         replay_canonical.input = replay_input;
@@ -1198,6 +1211,8 @@ async fn try_target(
         PersistHints {
             upstream_response_id: upstream_response_id.as_deref(),
             previous_response_id: canonical.previous_response_id.as_deref(),
+            input: &canonical.input,
+            status_override: None,
         },
     )
     .await;
@@ -1287,11 +1302,8 @@ async fn start_streaming_target_channel(
 
     match ready_rx.await {
         Ok(Ok(bootstrap)) => {
-            if let Some(upstream_response_id) = bootstrap.upstream_response_id {
-                info!(
-                    response_id = %upstream_response_id,
-                    "streaming bootstrap emitted first semantic event"
-                );
+            if bootstrap.upstream_response_id.is_some() {
+                info!("streaming bootstrap emitted first semantic event");
             }
             Ok(ReceiverStream::new(rx))
         }
@@ -1408,12 +1420,20 @@ async fn run_streaming_target_worker(
     let mut sse_writer = SseWriter::new();
     let downstream_stream_response_id = modelwire_core::generate_response_id();
     let mut stream_item_id_map: HashMap<String, String> = HashMap::new();
+    let mut stream_call_id_map: HashMap<String, String> = HashMap::new();
     let mut emitted_any_semantic = false;
     let mut sent_downstream_created = false;
     let mut collected_events: Vec<CanonicalEvent> = Vec::new();
     let mut fallback_after_commit_error: Option<Error> = None;
     let mut first_upstream_response_id: Option<String> = None;
     let mut committed = false;
+    let mut synthesized_text_items: HashMap<String, String> = HashMap::new();
+    let mut synthesized_tool_items: HashMap<String, StreamToolItem> = HashMap::new();
+    let mut completed_stream_item_ids: HashSet<String> = HashSet::new();
+    let mut added_stream_item_ids: HashSet<String> = HashSet::new();
+    let mut synthesized_tool_call_ids: HashMap<String, String> = HashMap::new();
+    let mut thinking_filters: HashMap<String, ThinkingFilterState> = HashMap::new();
+    let mut saw_stream_completed = false;
     let stream_started_at = Instant::now();
     let mut last_activity_at = stream_started_at;
     let idle_timeout = duration_from_secs_option(state.config.server.stream_idle_timeout_secs);
@@ -1527,7 +1547,13 @@ async fn run_streaming_target_worker(
                 &downstream_stream_response_id,
                 &route.downstream_model,
                 &mut stream_item_id_map,
+                &mut stream_call_id_map,
             );
+            let Some(downstream_event) =
+                filter_stream_event_thinking(downstream_event, &mut thinking_filters)
+            else {
+                continue;
+            };
             if !sent_downstream_created {
                 if !matches!(downstream_event, CanonicalEvent::ResponseCreated { .. }) {
                     let created_event = CanonicalEvent::ResponseCreated {
@@ -1541,6 +1567,22 @@ async fn run_streaming_target_worker(
                 }
                 sent_downstream_created = true;
             }
+            synthesize_stream_item_added_if_needed(
+                &downstream_event,
+                &mut sse_writer,
+                &mut collected_events,
+                &downstream_stream_response_id,
+                &mut added_stream_item_ids,
+                &mut synthesized_tool_call_ids,
+            );
+            collect_stream_completion_state(
+                &downstream_event,
+                &mut synthesized_text_items,
+                &mut synthesized_tool_items,
+                &mut completed_stream_item_ids,
+                &mut added_stream_item_ids,
+                &mut saw_stream_completed,
+            );
             let (event_type, payload) = canonical_to_sse(&downstream_event);
             if event_type == SseEventType::Unknown {
                 continue;
@@ -1580,6 +1622,20 @@ async fn run_streaming_target_worker(
     }
 
     let had_post_commit_failure = fallback_after_commit_error.is_some();
+    if !had_post_commit_failure {
+        synthesize_missing_stream_terminal_events(
+            &mut sse_writer,
+            &mut collected_events,
+            &downstream_stream_response_id,
+            StreamTerminalSynthesis {
+                text_items: &mut synthesized_text_items,
+                tool_items: &mut synthesized_tool_items,
+                completed_item_ids: &completed_stream_item_ids,
+                synthesized_tool_call_ids: &mut synthesized_tool_call_ids,
+                saw_completed: saw_stream_completed,
+            },
+        );
+    }
     if let Some(error) = fallback_after_commit_error.take() {
         let payload = serde_json::json!({
             "error": {
@@ -1597,15 +1653,20 @@ async fn run_streaming_target_worker(
         }
     }
 
-    let downstream = match normalize_downstream_response_with_id(
+    let stream_upstream_call_ids_by_downstream: HashMap<String, String> = stream_call_id_map
+        .iter()
+        .map(|(upstream, downstream)| (downstream.clone(), upstream.clone()))
+        .collect();
+    let downstream = match normalize_downstream_response_with_id_and_call_map(
         &route.downstream_model,
         collected_events.clone(),
         downstream_stream_response_id,
+        &stream_upstream_call_ids_by_downstream,
     ) {
         Ok(response) => response,
         Err(_error) => return,
     };
-    let upstream_response_id = extract_upstream_response_id(&collected_events);
+    let upstream_response_id = first_upstream_response_id;
     persist_response_shell(
         state.as_ref(),
         &canonical.request_id,
@@ -1616,6 +1677,8 @@ async fn run_streaming_target_worker(
         PersistHints {
             upstream_response_id: upstream_response_id.as_deref(),
             previous_response_id: canonical.previous_response_id.as_deref(),
+            input: &canonical.input,
+            status_override: had_post_commit_failure.then_some("failed"),
         },
     )
     .await;
@@ -2482,19 +2545,42 @@ fn normalize_downstream_response_with_id(
     events: Vec<CanonicalEvent>,
     response_id: String,
 ) -> Result<DownstreamResponse, Error> {
+    normalize_downstream_response_with_id_and_call_map(
+        downstream_model,
+        events,
+        response_id,
+        &HashMap::new(),
+    )
+}
+
+fn normalize_downstream_response_with_id_and_call_map(
+    downstream_model: &str,
+    events: Vec<CanonicalEvent>,
+    response_id: String,
+    upstream_call_ids_by_downstream: &HashMap<String, String>,
+) -> Result<DownstreamResponse, Error> {
     let mut output = Vec::new();
     let mut usage = None;
+    let mut call_id_map = HashMap::new();
+    let mut status = "completed";
 
     for event in events {
         match event {
             CanonicalEvent::OutputItemDone { item, .. } => {
-                output.push(normalize_output_item(item));
+                output.push(normalize_output_item(
+                    item,
+                    &mut call_id_map,
+                    upstream_call_ids_by_downstream,
+                ));
             }
             CanonicalEvent::ResponseCompleted {
                 usage: completed_usage,
                 ..
             } => {
                 usage = completed_usage;
+            }
+            CanonicalEvent::ResponseFailed { .. } => {
+                status = "failed";
             }
             _ => {}
         }
@@ -2505,7 +2591,7 @@ fn normalize_downstream_response_with_id(
         object: "response",
         created_at: chrono::Utc::now().timestamp(),
         model: downstream_model.to_string(),
-        status: "completed",
+        status,
         output,
         usage,
     })
@@ -2516,6 +2602,7 @@ fn rewrite_stream_event_for_downstream(
     downstream_response_id: &str,
     downstream_model: &str,
     item_id_map: &mut HashMap<String, String>,
+    call_id_map: &mut HashMap<String, String>,
 ) -> CanonicalEvent {
     match event {
         CanonicalEvent::ResponseCreated { created_at, .. } => CanonicalEvent::ResponseCreated {
@@ -2525,7 +2612,7 @@ fn rewrite_stream_event_for_downstream(
         },
         CanonicalEvent::OutputItemAdded { item, .. } => CanonicalEvent::OutputItemAdded {
             response_id: downstream_response_id.to_string(),
-            item: rewrite_output_item_ids(item, item_id_map),
+            item: rewrite_output_item_ids(item, item_id_map, call_id_map),
         },
         CanonicalEvent::OutputTextDelta { item_id, delta } => CanonicalEvent::OutputTextDelta {
             item_id: map_stream_item_id(item_id, item_id_map),
@@ -2539,7 +2626,7 @@ fn rewrite_stream_event_for_downstream(
         }
         CanonicalEvent::OutputItemDone { item, .. } => CanonicalEvent::OutputItemDone {
             response_id: downstream_response_id.to_string(),
-            item: rewrite_output_item_ids(item, item_id_map),
+            item: rewrite_output_item_ids(item, item_id_map, call_id_map),
         },
         CanonicalEvent::ReasoningSummaryDelta { item_id, delta } => {
             CanonicalEvent::ReasoningSummaryDelta {
@@ -2552,7 +2639,7 @@ fn rewrite_stream_event_for_downstream(
                 response_id: downstream_response_id.to_string(),
                 output: output
                     .into_iter()
-                    .map(|item| rewrite_output_item_ids(item, item_id_map))
+                    .map(|item| rewrite_output_item_ids(item, item_id_map, call_id_map))
                     .collect(),
                 usage,
             }
@@ -2567,6 +2654,7 @@ fn rewrite_stream_event_for_downstream(
 fn rewrite_output_item_ids(
     item: CanonicalOutputItem,
     item_id_map: &mut HashMap<String, String>,
+    call_id_map: &mut HashMap<String, String>,
 ) -> CanonicalOutputItem {
     match item {
         CanonicalOutputItem::Message { id, role, content } => CanonicalOutputItem::Message {
@@ -2581,7 +2669,7 @@ fn rewrite_output_item_ids(
             arguments,
         } => CanonicalOutputItem::FunctionCall {
             id: map_stream_message_id(id, item_id_map),
-            call_id,
+            call_id: map_stream_call_id(call_id, call_id_map),
             name,
             arguments,
         },
@@ -2590,6 +2678,144 @@ fn rewrite_output_item_ids(
             summary,
         },
     }
+}
+
+#[derive(Debug, Default)]
+struct ThinkingFilterState {
+    hidden: bool,
+    pending: String,
+}
+
+fn filter_stream_event_thinking(
+    event: CanonicalEvent,
+    filters: &mut HashMap<String, ThinkingFilterState>,
+) -> Option<CanonicalEvent> {
+    match event {
+        CanonicalEvent::OutputTextDelta { item_id, delta } => {
+            let visible =
+                filter_provider_thinking_delta(filters.entry(item_id.clone()).or_default(), &delta);
+            (!visible.is_empty()).then_some(CanonicalEvent::OutputTextDelta {
+                item_id,
+                delta: visible,
+            })
+        }
+        CanonicalEvent::OutputItemAdded { response_id, item } => {
+            Some(CanonicalEvent::OutputItemAdded {
+                response_id,
+                item: strip_provider_thinking_from_output_item(item),
+            })
+        }
+        CanonicalEvent::OutputItemDone { response_id, item } => {
+            Some(CanonicalEvent::OutputItemDone {
+                response_id,
+                item: strip_provider_thinking_from_output_item(item),
+            })
+        }
+        CanonicalEvent::ResponseCompleted {
+            response_id,
+            output,
+            usage,
+        } => Some(CanonicalEvent::ResponseCompleted {
+            response_id,
+            output: output
+                .into_iter()
+                .map(strip_provider_thinking_from_output_item)
+                .collect(),
+            usage,
+        }),
+        other => Some(other),
+    }
+}
+
+fn strip_provider_thinking_from_output_item(item: CanonicalOutputItem) -> CanonicalOutputItem {
+    match item {
+        CanonicalOutputItem::Message { id, role, content } => CanonicalOutputItem::Message {
+            id,
+            role,
+            content: content
+                .into_iter()
+                .map(|block| match block {
+                    ContentBlock::Text { text } => ContentBlock::Text {
+                        text: strip_provider_thinking_text(&text),
+                    },
+                    other => other,
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+fn strip_provider_thinking_text(text: &str) -> String {
+    let mut state = ThinkingFilterState::default();
+    let mut visible = filter_provider_thinking_delta(&mut state, text);
+    if !state.hidden {
+        visible.push_str(&state.pending);
+    }
+    visible
+}
+
+fn filter_provider_thinking_delta(state: &mut ThinkingFilterState, delta: &str) -> String {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+
+    let mut input = String::new();
+    input.push_str(&state.pending);
+    input.push_str(delta);
+    state.pending.clear();
+
+    let mut visible = String::new();
+    let mut cursor = 0;
+
+    while cursor < input.len() {
+        let haystack = input[cursor..].to_ascii_lowercase();
+        if state.hidden {
+            if let Some(pos) = haystack.find(CLOSE) {
+                cursor += pos + CLOSE.len();
+                state.hidden = false;
+            } else {
+                state.pending = longest_tag_prefix_suffix(&input[cursor..], CLOSE);
+                return visible;
+            }
+        } else if let Some(pos) = haystack.find(OPEN) {
+            let end = cursor + pos;
+            visible.push_str(&input[cursor..end]);
+            cursor = end + OPEN.len();
+            state.hidden = true;
+        } else {
+            let suffix = longest_tag_prefix_suffix(&input[cursor..], OPEN);
+            let emit_len = input[cursor..].len().saturating_sub(suffix.len());
+            visible.push_str(&input[cursor..cursor + emit_len]);
+            state.pending = suffix;
+            return visible;
+        }
+    }
+
+    visible
+}
+
+fn longest_tag_prefix_suffix(input: &str, tag: &str) -> String {
+    let max_len = input.len().min(tag.len().saturating_sub(1));
+    for len in (1..=max_len).rev() {
+        let suffix = &input[input.len() - len..];
+        if tag.starts_with(&suffix.to_ascii_lowercase()) {
+            return suffix.to_string();
+        }
+    }
+    String::new()
+}
+
+fn map_stream_call_id(id: String, call_id_map: &mut HashMap<String, String>) -> String {
+    if modelwire_core::is_modelwire_id(&id) {
+        return id;
+    }
+    if id.is_empty() {
+        return modelwire_core::generate_call_id();
+    }
+    call_id_map
+        .entry(id)
+        .or_insert_with(modelwire_core::generate_call_id)
+        .clone()
 }
 
 fn map_stream_message_id(id: String, item_id_map: &mut HashMap<String, String>) -> String {
@@ -2618,14 +2844,228 @@ fn map_stream_item_id(id: String, item_id_map: &mut HashMap<String, String>) -> 
         .clone()
 }
 
-fn normalize_output_item(item: CanonicalOutputItem) -> DownstreamOutputItem {
+fn synthesize_stream_item_added_if_needed(
+    event: &CanonicalEvent,
+    sse_writer: &mut SseWriter,
+    collected_events: &mut Vec<CanonicalEvent>,
+    response_id: &str,
+    added_item_ids: &mut HashSet<String>,
+    synthesized_tool_call_ids: &mut HashMap<String, String>,
+) {
+    match event {
+        CanonicalEvent::OutputItemAdded { item, .. } => {
+            if let Some(item_id) = canonical_output_item_id(item) {
+                added_item_ids.insert(item_id.to_string());
+            }
+        }
+        CanonicalEvent::OutputTextDelta { item_id, .. } => {
+            if added_item_ids.insert(item_id.clone()) {
+                let added = CanonicalEvent::OutputItemAdded {
+                    response_id: response_id.to_string(),
+                    item: CanonicalOutputItem::Message {
+                        id: item_id.clone(),
+                        role: "assistant".to_string(),
+                        content: Vec::new(),
+                    },
+                };
+                let (event_type, payload) = canonical_to_sse(&added);
+                sse_writer.write_event(event_type, &payload);
+                collected_events.push(added);
+            }
+        }
+        CanonicalEvent::FunctionCallArgumentsDelta { item_id, .. } => {
+            if added_item_ids.insert(item_id.clone()) {
+                let call_id = synthesized_tool_call_ids
+                    .entry(item_id.clone())
+                    .or_insert_with(modelwire_core::generate_call_id)
+                    .clone();
+                let added = CanonicalEvent::OutputItemAdded {
+                    response_id: response_id.to_string(),
+                    item: CanonicalOutputItem::FunctionCall {
+                        id: item_id.clone(),
+                        call_id,
+                        name: "unknown_tool".to_string(),
+                        arguments: String::new(),
+                    },
+                };
+                let (event_type, payload) = canonical_to_sse(&added);
+                sse_writer.write_event(event_type, &payload);
+                collected_events.push(added);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_stream_completion_state(
+    event: &CanonicalEvent,
+    text_items: &mut HashMap<String, String>,
+    tool_items: &mut HashMap<String, StreamToolItem>,
+    completed_item_ids: &mut HashSet<String>,
+    added_item_ids: &mut HashSet<String>,
+    saw_completed: &mut bool,
+) {
+    match event {
+        CanonicalEvent::OutputItemAdded { item, .. } => {
+            if let Some(item_id) = canonical_output_item_id(item) {
+                added_item_ids.insert(item_id.to_string());
+                if let CanonicalOutputItem::FunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                    ..
+                } = item
+                {
+                    let entry = tool_items.entry(item_id.to_string()).or_default();
+                    if !call_id.is_empty() {
+                        entry.call_id = Some(call_id.clone());
+                    }
+                    if !name.is_empty() {
+                        entry.name = Some(name.clone());
+                    }
+                    if !arguments.is_empty() {
+                        entry.arguments.push_str(arguments);
+                    }
+                }
+            }
+        }
+        CanonicalEvent::OutputTextDelta { item_id, delta } => {
+            text_items
+                .entry(item_id.clone())
+                .or_default()
+                .push_str(delta);
+        }
+        CanonicalEvent::FunctionCallArgumentsDelta { item_id, delta } => {
+            tool_items
+                .entry(item_id.clone())
+                .or_default()
+                .arguments
+                .push_str(delta);
+        }
+        CanonicalEvent::OutputItemDone { item, .. } => {
+            if let Some(item_id) = canonical_output_item_id(item) {
+                completed_item_ids.insert(item_id.to_string());
+                text_items.remove(item_id);
+                tool_items.remove(item_id);
+                added_item_ids.insert(item_id.to_string());
+            }
+        }
+        CanonicalEvent::ResponseCompleted { .. } => {
+            *saw_completed = true;
+        }
+        _ => {}
+    }
+}
+
+struct StreamTerminalSynthesis<'a> {
+    text_items: &'a mut HashMap<String, String>,
+    tool_items: &'a mut HashMap<String, StreamToolItem>,
+    completed_item_ids: &'a HashSet<String>,
+    synthesized_tool_call_ids: &'a mut HashMap<String, String>,
+    saw_completed: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StreamToolItem {
+    call_id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+fn synthesize_missing_stream_terminal_events(
+    sse_writer: &mut SseWriter,
+    collected_events: &mut Vec<CanonicalEvent>,
+    response_id: &str,
+    state: StreamTerminalSynthesis<'_>,
+) {
+    for (item_id, text) in state.text_items.clone() {
+        if text.is_empty() || state.completed_item_ids.contains(&item_id) {
+            continue;
+        }
+        let done = CanonicalEvent::OutputItemDone {
+            response_id: response_id.to_string(),
+            item: CanonicalOutputItem::Message {
+                id: item_id,
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text { text }],
+            },
+        };
+        let (event_type, payload) = canonical_to_sse(&done);
+        sse_writer.write_event(event_type, &payload);
+        collected_events.push(done);
+    }
+
+    for (item_id, tool_state) in state.tool_items.clone() {
+        if state.completed_item_ids.contains(&item_id) {
+            continue;
+        }
+        let call_id = tool_state.call_id.unwrap_or_else(|| {
+            state
+                .synthesized_tool_call_ids
+                .entry(item_id.clone())
+                .or_insert_with(modelwire_core::generate_call_id)
+                .clone()
+        });
+        let done = CanonicalEvent::OutputItemDone {
+            response_id: response_id.to_string(),
+            item: CanonicalOutputItem::FunctionCall {
+                id: item_id,
+                call_id,
+                name: tool_state
+                    .name
+                    .unwrap_or_else(|| "unknown_tool".to_string()),
+                arguments: tool_state.arguments,
+            },
+        };
+        let (event_type, payload) = canonical_to_sse(&done);
+        sse_writer.write_event(event_type, &payload);
+        collected_events.push(done);
+    }
+
+    if !state.saw_completed {
+        let output = collected_events
+            .iter()
+            .filter_map(|event| match event {
+                CanonicalEvent::OutputItemDone { item, .. } => Some(item.clone()),
+                _ => None,
+            })
+            .collect();
+        let completed = CanonicalEvent::ResponseCompleted {
+            response_id: response_id.to_string(),
+            output,
+            usage: None,
+        };
+        let (event_type, payload) = canonical_to_sse(&completed);
+        sse_writer.write_event(event_type, &payload);
+        collected_events.push(completed);
+    }
+}
+
+fn canonical_output_item_id(item: &CanonicalOutputItem) -> Option<&str> {
+    match item {
+        CanonicalOutputItem::Message { id, .. }
+        | CanonicalOutputItem::FunctionCall { id, .. }
+        | CanonicalOutputItem::Reasoning { id, .. }
+            if !id.is_empty() =>
+        {
+            Some(id.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn normalize_output_item(
+    item: CanonicalOutputItem,
+    call_id_map: &mut HashMap<String, String>,
+    upstream_call_ids_by_downstream: &HashMap<String, String>,
+) -> DownstreamOutputItem {
     match item {
         CanonicalOutputItem::Message { id, role, content } => {
             let content = content
                 .into_iter()
                 .filter_map(|block| match block {
                     ContentBlock::Text { text } => Some(DownstreamContentBlock::OutputText {
-                        text,
+                        text: strip_provider_thinking_text(&text),
                         annotations: Vec::new(),
                     }),
                     _ => None,
@@ -2648,17 +3088,29 @@ fn normalize_output_item(item: CanonicalOutputItem) -> DownstreamOutputItem {
             call_id,
             name,
             arguments,
-        } => DownstreamOutputItem::FunctionCall {
-            id: if modelwire_core::is_modelwire_id(&id) {
-                id
-            } else {
-                modelwire_core::generate_message_id()
-            },
-            call_id,
-            name,
-            arguments,
-            status: "completed",
-        },
+        } => {
+            let mapped_call_id = map_stream_call_id(call_id.clone(), call_id_map);
+            let upstream_call_id = upstream_call_ids_by_downstream
+                .get(&mapped_call_id)
+                .cloned()
+                .or_else(|| {
+                    (!modelwire_core::is_modelwire_id(&call_id))
+                        .then(|| call_id.clone())
+                        .filter(|id| !id.is_empty())
+                });
+            DownstreamOutputItem::FunctionCall {
+                id: if modelwire_core::is_modelwire_id(&id) {
+                    id
+                } else {
+                    modelwire_core::generate_message_id()
+                },
+                call_id: mapped_call_id,
+                upstream_call_id,
+                name,
+                arguments,
+                status: "completed",
+            }
+        }
         CanonicalOutputItem::Reasoning { id, summary } => DownstreamOutputItem::Reasoning {
             id: if modelwire_core::is_modelwire_id(&id) {
                 id
@@ -2686,6 +3138,7 @@ async fn persist_response_shell(
         .usage
         .as_ref()
         .and_then(|usage| serde_json::to_string(usage).ok());
+    let status = hints.status_override.unwrap_or(response.status);
 
     if let Err(error) = modelwire_db::repo::responses::store_response_metadata(
         &state.db,
@@ -2701,7 +3154,7 @@ async fn persist_response_shell(
             upstream_response_id: hints.upstream_response_id,
             state_scope: target.state_scope.as_deref(),
             previous_response_id: hints.previous_response_id,
-            status: response.status,
+            status,
             usage_json: usage_json.as_deref(),
             error_json: None,
         },
@@ -2753,6 +3206,20 @@ async fn persist_response_shell(
         }
     }
 
+    for (sequence, item) in hints.input.iter().enumerate() {
+        if let Err(error) =
+            persist_request_input_item(state, &response.id, -100_000 + sequence as i64, item).await
+        {
+            warn!(
+                request_id = %request_id,
+                response_id = %response.id,
+                target_id = %target.target_id,
+                error = %error,
+                "Failed to persist request input item"
+            );
+        }
+    }
+
     for (sequence, item) in response.output.iter().enumerate() {
         if let Err(error) = persist_response_item(state, &response.id, sequence as i64, item).await
         {
@@ -2763,6 +3230,96 @@ async fn persist_response_shell(
                 error = %error,
                 "Failed to persist response item"
             );
+        }
+    }
+}
+
+async fn persist_request_input_item(
+    state: &ServerState,
+    response_id: &str,
+    sequence: i64,
+    item: &CanonicalInputItem,
+) -> Result<(), sqlx::Error> {
+    match item {
+        CanonicalInputItem::Text { content } => {
+            let content_json = serde_json::json!([{
+                "type": "input_text",
+                "text": content,
+            }])
+            .to_string();
+            modelwire_db::repo::responses::store_response_item(
+                &state.db,
+                &ResponseItemInsert {
+                    id: &format!("in_{}", uuid::Uuid::now_v7()),
+                    response_id,
+                    sequence,
+                    item_type: "input_message",
+                    role: Some("user"),
+                    call_id: None,
+                    content_json: &content_json,
+                    visible: true,
+                },
+            )
+            .await
+        }
+        CanonicalInputItem::Message { role, content } => {
+            let content_json = serde_json::to_string(content).unwrap_or_else(|_| "[]".to_string());
+            modelwire_db::repo::responses::store_response_item(
+                &state.db,
+                &ResponseItemInsert {
+                    id: &format!("in_{}", uuid::Uuid::now_v7()),
+                    response_id,
+                    sequence,
+                    item_type: "input_message",
+                    role: Some(role),
+                    call_id: None,
+                    content_json: &content_json,
+                    visible: true,
+                },
+            )
+            .await
+        }
+        CanonicalInputItem::FunctionCallOutput { call_id, output } => {
+            let content_json = serde_json::json!({ "output": output }).to_string();
+            modelwire_db::repo::responses::store_response_item(
+                &state.db,
+                &ResponseItemInsert {
+                    id: &format!("in_{}", uuid::Uuid::now_v7()),
+                    response_id,
+                    sequence,
+                    item_type: "function_call_output",
+                    role: None,
+                    call_id: Some(call_id),
+                    content_json: &content_json,
+                    visible: true,
+                },
+            )
+            .await
+        }
+        CanonicalInputItem::AssistantFunctionCall {
+            call_id,
+            name,
+            arguments,
+        } => {
+            let content_json = serde_json::json!({
+                "name": name,
+                "arguments": arguments,
+            })
+            .to_string();
+            modelwire_db::repo::responses::store_response_item(
+                &state.db,
+                &ResponseItemInsert {
+                    id: &format!("in_{}", uuid::Uuid::now_v7()),
+                    response_id,
+                    sequence,
+                    item_type: "input_function_call",
+                    role: None,
+                    call_id: Some(call_id),
+                    content_json: &content_json,
+                    visible: true,
+                },
+            )
+            .await
         }
     }
 }
@@ -2796,6 +3353,7 @@ async fn persist_response_item(
         DownstreamOutputItem::FunctionCall {
             id,
             call_id,
+            upstream_call_id,
             name,
             arguments,
             ..
@@ -2803,6 +3361,7 @@ async fn persist_response_item(
             let content_json = serde_json::json!({
                 "name": name,
                 "arguments": arguments,
+                "upstream_call_id": upstream_call_id,
             })
             .to_string();
             modelwire_db::repo::responses::store_response_item(
@@ -3082,7 +3641,7 @@ fn redacted_upstream_error(body: &[u8]) -> String {
     if trimmed.is_empty() {
         "Upstream returned an error".to_string()
     } else {
-        trimmed.chars().take(512).collect()
+        Redactor::new().redact(trimmed).chars().take(512).collect()
     }
 }
 
@@ -3757,17 +4316,20 @@ async fn load_continuation_context(
         ));
     };
 
-    let items = get_items(&state.db, previous_response_id)
-        .await
-        .map_err(|error| {
-            Error::new(
-                ErrorKind::InternalError,
-                format!("Failed to load previous response items: {error}"),
-            )
-        })?;
+    if previous.status != "completed" {
+        return Err(Error::new(
+            ErrorKind::StateNotContinuable,
+            format!(
+                "previous_response_id '{previous_response_id}' has status '{}' and cannot be continued",
+                previous.status
+            ),
+        ));
+    }
 
-    let replay_items = to_replay_input_items(&items)?;
-    let known_call_ids = extract_known_call_ids(&items);
+    let chain_items = load_replay_chain_items(state, previous_response_id).await?;
+    let replay_items = to_replay_input_items(&chain_items)?;
+    let known_call_ids = extract_known_call_ids(&chain_items);
+    let tool_call_id_map = extract_tool_call_id_map(&chain_items);
     let previous_handle = get_latest_upstream_handle(&state.db, previous_response_id)
         .await
         .map_err(|error| {
@@ -3791,7 +4353,68 @@ async fn load_continuation_context(
         previous_credential_hash,
         replay_items,
         known_call_ids,
+        tool_call_id_map,
     }))
+}
+
+async fn load_replay_chain_items(
+    state: &ServerState,
+    previous_response_id: &str,
+) -> Result<Vec<ItemRecord>, Error> {
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cursor = Some(previous_response_id.to_string());
+
+    while let Some(response_id) = cursor {
+        if !seen.insert(response_id.clone()) {
+            return Err(Error::new(
+                ErrorKind::StateReplayFailed,
+                format!("Cycle detected in response chain at '{response_id}'"),
+            ));
+        }
+
+        let response = get_response(&state.db, &response_id)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::InternalError,
+                    format!("Failed to load response chain state: {error}"),
+                )
+            })?
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::StateReplayFailed,
+                    format!("Response chain references missing state '{response_id}'"),
+                )
+            })?;
+
+        if response.status != "completed" {
+            return Err(Error::new(
+                ErrorKind::StateNotContinuable,
+                format!(
+                    "Response chain state '{}' has status '{}' and cannot be replayed",
+                    response.id, response.status
+                ),
+            ));
+        }
+
+        cursor = response.previous_response_id.clone();
+        ids.push(response.id);
+    }
+
+    ids.reverse();
+    let mut chain_items = Vec::new();
+    for response_id in ids {
+        let mut items = get_items(&state.db, &response_id).await.map_err(|error| {
+            Error::new(
+                ErrorKind::InternalError,
+                format!("Failed to load response chain items: {error}"),
+            )
+        })?;
+        chain_items.append(&mut items);
+    }
+
+    Ok(chain_items)
 }
 
 fn to_replay_input_items(items: &[ItemRecord]) -> Result<Vec<CanonicalInputItem>, Error> {
@@ -3799,6 +4422,58 @@ fn to_replay_input_items(items: &[ItemRecord]) -> Result<Vec<CanonicalInputItem>
 
     for item in items {
         match item.item_type.as_str() {
+            "input_message" => {
+                if item.visible == 0 {
+                    continue;
+                }
+                let role = item.role.clone().unwrap_or_else(|| "user".to_string());
+                let value: serde_json::Value =
+                    serde_json::from_str(&item.content_json).unwrap_or(serde_json::Value::Null);
+                let blocks = parse_output_content_json_to_blocks(value);
+                if !blocks.is_empty() {
+                    replay.push(CanonicalInputItem::Message {
+                        role,
+                        content: blocks,
+                    });
+                }
+            }
+            "function_call_output" => {
+                let value: serde_json::Value =
+                    serde_json::from_str(&item.content_json).unwrap_or(serde_json::Value::Null);
+                let output = value
+                    .get("output")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let call_id = item
+                    .call_id
+                    .clone()
+                    .unwrap_or_else(modelwire_core::generate_call_id);
+                replay.push(CanonicalInputItem::FunctionCallOutput { call_id, output });
+            }
+            "input_function_call" => {
+                let value: serde_json::Value =
+                    serde_json::from_str(&item.content_json).unwrap_or(serde_json::Value::Null);
+                let arguments = value
+                    .get("arguments")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("{}")
+                    .to_string();
+                let name = value
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown_tool")
+                    .to_string();
+                let call_id = item
+                    .call_id
+                    .clone()
+                    .unwrap_or_else(modelwire_core::generate_call_id);
+                replay.push(CanonicalInputItem::AssistantFunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                });
+            }
             "message" => {
                 if item.visible == 0 {
                     continue;
@@ -3853,11 +4528,35 @@ fn to_replay_input_items(items: &[ItemRecord]) -> Result<Vec<CanonicalInputItem>
 fn extract_known_call_ids(items: &[ItemRecord]) -> HashSet<String> {
     let mut ids = HashSet::new();
     for item in items {
-        if item.item_type == "function_call" {
+        if item.item_type == "function_call" || item.item_type == "input_function_call" {
             if let Some(call_id) = item.call_id.as_ref() {
                 ids.insert(call_id.clone());
             }
         }
+    }
+    ids
+}
+
+fn extract_tool_call_id_map(items: &[ItemRecord]) -> HashMap<String, String> {
+    let mut ids = HashMap::new();
+    for item in items {
+        if item.item_type != "function_call" {
+            continue;
+        }
+        let Some(downstream_call_id) = item.call_id.as_ref() else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&item.content_json) else {
+            continue;
+        };
+        let Some(upstream_call_id) = value
+            .get("upstream_call_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        ids.insert(downstream_call_id.clone(), upstream_call_id.to_string());
     }
     ids
 }
@@ -3891,6 +4590,7 @@ fn apply_continuation_to_canonical(
     canonical: &mut CanonicalResponseRequest,
     continuation: Option<&ContinuationContext>,
     target: &TargetSnapshot,
+    wire_api: WireApi,
     downstream_authorization: Option<&str>,
 ) -> Result<(), Error> {
     let Some(continuation) = continuation else {
@@ -3899,12 +4599,89 @@ fn apply_continuation_to_canonical(
 
     validate_tool_result_ids(canonical, continuation)?;
     canonical.previous_response_id = None;
-    canonical.input = replay_input_for_canonical(canonical, Some(continuation));
 
-    if can_send_upstream_previous_response_id(continuation, target, downstream_authorization) {
+    if can_send_upstream_previous_response_id(
+        continuation,
+        target,
+        wire_api,
+        downstream_authorization,
+    ) {
+        canonical.input = map_current_tool_outputs_to_upstream(canonical, continuation);
         canonical.previous_response_id = continuation.previous_upstream_handle.clone();
+    } else {
+        canonical.input = replay_input_for_canonical(canonical, Some(continuation));
     }
     Ok(())
+}
+
+fn map_current_tool_outputs_to_upstream(
+    canonical: &CanonicalResponseRequest,
+    continuation: &ContinuationContext,
+) -> Vec<CanonicalInputItem> {
+    canonical
+        .input
+        .iter()
+        .map(|item| match item {
+            CanonicalInputItem::FunctionCallOutput { call_id, output } => {
+                let upstream_call_id = continuation
+                    .tool_call_id_map
+                    .get(call_id)
+                    .cloned()
+                    .unwrap_or_else(|| call_id.clone());
+                CanonicalInputItem::FunctionCallOutput {
+                    call_id: upstream_call_id,
+                    output: output.clone(),
+                }
+            }
+            other => other.clone(),
+        })
+        .collect()
+}
+
+fn map_current_tool_outputs_to_downstream(
+    input: &[CanonicalInputItem],
+    continuation: &ContinuationContext,
+) -> Vec<CanonicalInputItem> {
+    let upstream_to_downstream: HashMap<&str, &str> = continuation
+        .tool_call_id_map
+        .iter()
+        .map(|(downstream, upstream)| (upstream.as_str(), downstream.as_str()))
+        .collect();
+    input
+        .iter()
+        .map(|item| match item {
+            CanonicalInputItem::FunctionCallOutput { call_id, output } => {
+                CanonicalInputItem::FunctionCallOutput {
+                    call_id: upstream_to_downstream
+                        .get(call_id.as_str())
+                        .copied()
+                        .unwrap_or(call_id)
+                        .to_string(),
+                    output: output.clone(),
+                }
+            }
+            other => other.clone(),
+        })
+        .collect()
+}
+
+fn canonical_for_context_guard(
+    canonical: &CanonicalResponseRequest,
+    continuation: Option<&ContinuationContext>,
+) -> CanonicalResponseRequest {
+    let Some(continuation) = continuation else {
+        return canonical.clone();
+    };
+    if canonical.previous_response_id.is_none() {
+        return canonical.clone();
+    }
+
+    let mut replay_canonical = canonical.clone();
+    replay_canonical.previous_response_id = None;
+    replay_canonical.input =
+        map_current_tool_outputs_to_downstream(&replay_canonical.input, continuation);
+    replay_canonical.input = replay_input_for_canonical(&replay_canonical, Some(continuation));
+    replay_canonical
 }
 
 fn validate_tool_result_ids(
@@ -3939,6 +4716,7 @@ fn replay_input_for_canonical(
 fn can_send_upstream_previous_response_id(
     continuation: &ContinuationContext,
     target: &TargetSnapshot,
+    wire_api: WireApi,
     downstream_authorization: Option<&str>,
 ) -> bool {
     let Some(previous_handle) = continuation.previous_upstream_handle.as_ref() else {
@@ -3956,24 +4734,27 @@ fn can_send_upstream_previous_response_id(
     let Some(previous_wire_api) = continuation.previous_wire_api else {
         return false;
     };
+    if wire_api != WireApi::Responses || previous_wire_api != WireApi::Responses {
+        return false;
+    }
     let Some(previous_credential_hash) = continuation.previous_credential_hash.as_deref() else {
         return false;
     };
 
     let same_provider = target.provider_id == previous_provider_id;
-    let same_scope = target.state_scope.as_deref() == continuation.previous_state_scope.as_deref();
+    let same_scope = matches!(
+        (
+            target.state_scope.as_deref(),
+            continuation.previous_state_scope.as_deref()
+        ),
+        (Some(current), Some(previous)) if !current.is_empty() && current == previous
+    );
     if !same_provider && !same_scope {
         return false;
     }
     if target.upstream_model != previous_upstream_model {
         return false;
     }
-    if target.configured_wire_api != previous_wire_api
-        && target.configured_wire_api != WireApi::Auto
-    {
-        return false;
-    }
-
     if same_provider {
         let current_key = resolve_upstream_key(target, downstream_authorization);
         let current_hash = credential_hash_for_probe(current_key.as_deref(), &target.provider_id);
@@ -5199,6 +5980,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_previous_response_id_returns_state_not_continuable() {
+        let state = Arc::new(
+            build_state_with_single_target("https://example.invalid", "responses", Some("k1"))
+                .await,
+        );
+        modelwire_db::repo::responses::store_response_metadata(
+            &state.db,
+            &ResponseInsert {
+                id: "resp_mw_failed_prev",
+                request_id: "req_failed_prev",
+                downstream_model: "codex-main",
+                route_id: Some("route-a"),
+                target_id: Some("route-a:provider-a:10"),
+                provider_id: Some("provider-a"),
+                upstream_model: Some("gpt-upstream"),
+                wire_api: Some("responses"),
+                upstream_response_id: Some("resp_upstream_failed_prev"),
+                state_scope: Some("scope-a"),
+                previous_response_id: None,
+                status: "failed",
+                usage_json: None,
+                error_json: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let request = serde_json::json!({
+            "model": "codex-main",
+            "input": "next",
+            "previous_response_id": "resp_mw_failed_prev"
+        });
+        let error = relay_non_streaming_response(
+            Arc::clone(&state),
+            "req_failed_prev_next".to_string(),
+            request,
+            Some("Bearer mw_k1".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::StateNotContinuable);
+    }
+
+    #[tokio::test]
     async fn previous_response_same_upstream() {
         let mock = MockServer::start().await;
         let previous_upstream = "resp_upstream_prev";
@@ -5212,6 +6037,11 @@ mod tests {
                     body.get("previous_response_id")
                         .and_then(serde_json::Value::as_str),
                     Some(previous_upstream)
+                );
+                assert_eq!(
+                    body.get("input").and_then(serde_json::Value::as_str),
+                    Some("next"),
+                    "same-upstream continuation must use the upstream handle without replaying transcript history"
                 );
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "id": current_upstream,
@@ -5248,6 +6078,67 @@ mod tests {
         .unwrap();
 
         assert!(response.id.starts_with("resp_mw_"));
+    }
+
+    #[test]
+    fn cross_provider_handle_reuse_requires_explicit_state_scope() {
+        let continuation = ContinuationContext {
+            previous_upstream_handle: Some("resp_upstream_prev".to_string()),
+            previous_provider_id: Some("provider-a".to_string()),
+            previous_upstream_model: Some("gpt-upstream".to_string()),
+            previous_wire_api: Some(WireApi::Responses),
+            previous_state_scope: None,
+            previous_credential_hash: Some("hash-prev".to_string()),
+            replay_items: Vec::new(),
+            known_call_ids: HashSet::new(),
+            tool_call_id_map: HashMap::new(),
+        };
+        let target = TargetSnapshot {
+            target_id: "target-b".to_string(),
+            provider_id: "provider-b".to_string(),
+            provider_name: "Provider B".to_string(),
+            provider_base_url: "https://example.com".to_string(),
+            provider_auth_mode: "managed".to_string(),
+            provider_api_key: Some("k2".to_string()),
+            state_scope: None,
+            upstream_model: "gpt-upstream".to_string(),
+            configured_wire_api: WireApi::Responses,
+            priority: 10,
+            context_window_tokens: None,
+            max_output_tokens: None,
+            context_safety_margin_tokens: None,
+            context_overflow_policy: "reject".to_string(),
+        };
+
+        assert!(
+            !can_send_upstream_previous_response_id(&continuation, &target, WireApi::Responses, None),
+            "two missing state_scope values must not authorize cross-provider upstream handle reuse"
+        );
+    }
+
+    #[test]
+    fn upstream_error_message_redacts_secret_material() {
+        let message = redacted_upstream_error(
+            br#"{"error":"bad upstream key","authorization":"Bearer sk-1234567890abcdef"}"#,
+        );
+        assert!(message.contains("[REDACTED]") || message.contains("[API_KEY_REDACTED]"));
+        assert!(!message.contains("sk-1234567890abcdef"));
+    }
+
+    #[test]
+    fn provider_thinking_tags_are_stripped_from_visible_text() {
+        assert_eq!(
+            strip_provider_thinking_text("<think>hidden chain</think>visible answer"),
+            "visible answer"
+        );
+
+        let mut state = ThinkingFilterState::default();
+        assert_eq!(filter_provider_thinking_delta(&mut state, "<thi"), "");
+        assert_eq!(filter_provider_thinking_delta(&mut state, "nk>secret"), "");
+        assert_eq!(
+            filter_provider_thinking_delta(&mut state, "</think>ok"),
+            "ok"
+        );
     }
 
     #[tokio::test]
@@ -5708,7 +6599,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 "event: response.created\n\
                  data: {\"response\":{\"id\":\"resp_upstream\",\"model\":\"gpt-upstream\",\"created_at\":1}}\n\n\
-                 event: response.text.delta\n\
+                 event: response.output_text.delta\n\
                  data: {\"item_id\":\"msg_1\",\"delta\":{\"text\":\"ok\"}}\n\n\
                  event: response.completed\n\
                  data: {\"response\":{\"id\":\"resp_upstream\",\"output\":[]}}\n\n",
@@ -5785,6 +6676,16 @@ mod tests {
         assert!(merged.contains("event: response.created"));
         assert!(merged.contains("event: response.failed"));
         assert!(!merged.contains("resp_second"));
+        let response_id = merged
+            .split("\"id\":\"")
+            .nth(1)
+            .and_then(|tail| tail.split('"').next())
+            .expect("downstream response id should be present in response.created");
+        let persisted = get_response(&state.db, response_id)
+            .await
+            .unwrap()
+            .expect("streaming failed response should still be persisted");
+        assert_eq!(persisted.status, "failed");
     }
 
     #[tokio::test]
@@ -5805,7 +6706,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 "event: response.created\n\
                  data: {\"response\":{\"id\":\"resp_fast\",\"model\":\"gpt-upstream\",\"created_at\":1}}\n\n\
-                 event: response.text.delta\n\
+                 event: response.output_text.delta\n\
                  data: {\"item_id\":\"msg_fast\",\"delta\":{\"text\":\"fallback-ok\"}}\n\n\
                  event: response.completed\n\
                  data: {\"response\":{\"id\":\"resp_fast\",\"output\":[]}}\n\n",
@@ -6330,6 +7231,7 @@ mod tests {
             security: SecurityConfig {
                 downstream_auth: "relay_key".to_string(),
                 log_secret: Some(relay_secret.to_string()),
+                managed_key_encryption_secret: Some("test-managed-key-secret".to_string()),
                 relay_keys: vec![RelayKeyConfig {
                     key_hash: hash_key_for_logging("mw_k1", relay_secret),
                     enabled: true,
@@ -6399,6 +7301,7 @@ mod tests {
             security: SecurityConfig {
                 downstream_auth: "relay_key".to_string(),
                 log_secret: Some(relay_secret.to_string()),
+                managed_key_encryption_secret: Some("test-managed-key-secret".to_string()),
                 relay_keys: vec![RelayKeyConfig {
                     key_hash: hash_key_for_logging("mw_k1", relay_secret),
                     enabled: true,
@@ -6546,6 +7449,7 @@ mod tests {
             security: SecurityConfig {
                 downstream_auth: "relay_key".to_string(),
                 log_secret: Some(relay_secret.to_string()),
+                managed_key_encryption_secret: Some("test-managed-key-secret".to_string()),
                 relay_keys: vec![RelayKeyConfig {
                     key_hash: hash_key_for_logging("mw_k1", relay_secret),
                     enabled: true,
@@ -6628,6 +7532,7 @@ mod tests {
             security: SecurityConfig {
                 downstream_auth: "relay_key".to_string(),
                 log_secret: Some(relay_secret.to_string()),
+                managed_key_encryption_secret: Some("test-managed-key-secret".to_string()),
                 relay_keys: vec![RelayKeyConfig {
                     key_hash: hash_key_for_logging("mw_k1", relay_secret),
                     enabled: true,

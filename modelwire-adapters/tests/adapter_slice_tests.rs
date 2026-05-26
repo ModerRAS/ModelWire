@@ -271,7 +271,7 @@ mod responses_adapter_tests {
         let data = r#"{"item_id":"msg_001","delta":{"text":"Hello"}}"#.as_bytes();
 
         let event = adapter
-            .parse_sse_event("response.text.delta", data)
+            .parse_sse_event("response.output_text.delta", data)
             .unwrap()
             .unwrap();
 
@@ -1238,7 +1238,7 @@ mod sse_utilities_tests {
             SseEventType::ResponseCreated
         );
         assert_eq!(
-            SseEventType::parse("response.text.delta"),
+            SseEventType::parse("response.output_text.delta"),
             SseEventType::ResponseTextDelta
         );
         assert_eq!(
@@ -1257,7 +1257,7 @@ mod sse_utilities_tests {
         assert_eq!(SseEventType::ResponseCreated.as_str(), "response.created");
         assert_eq!(
             SseEventType::ResponseTextDelta.as_str(),
-            "response.text.delta"
+            "response.output_text.delta"
         );
         assert_eq!(
             SseEventType::ResponseCompleted.as_str(),
@@ -1282,12 +1282,15 @@ mod sse_utilities_tests {
     #[test]
     fn test_extract_sse_frames_multiple() {
         let mut buffer = BytesMut::new();
-        let data = b"event: response.created\ndata: {\"id\":\"1\"}\n\nevent: response.text.delta\ndata: {\"delta\":\"hi\"}\n\n";
+        let data = b"event: response.created\ndata: {\"id\":\"1\"}\n\nevent: response.output_text.delta\ndata: {\"delta\":\"hi\"}\n\n";
         let frames = extract_sse_frames(&mut buffer, data);
 
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].event.as_deref(), Some("response.created"));
-        assert_eq!(frames[1].event.as_deref(), Some("response.text.delta"));
+        assert_eq!(
+            frames[1].event.as_deref(),
+            Some("response.output_text.delta")
+        );
     }
 
     #[test]

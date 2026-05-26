@@ -353,7 +353,7 @@ impl UpstreamAdapter for ResponsesAdapter {
                     item: output_item,
                 }))
             }
-            "response.text.delta" => {
+            "response.output_text.delta" | "response.text.delta" => {
                 let item_id = json.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
                 let delta = json
                     .get("delta")

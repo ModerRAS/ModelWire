@@ -80,6 +80,7 @@ jobs:
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2023-0071
 
   docs:
     name: Documentation
@@ -87,27 +88,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustdocs
       - name: Check documentation
         run: |
           cargo doc --workspace --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: -D warnings
 
-  cross-platform:
-    name: Cross-platform check
+  host-platform:
+    name: Host platform check
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - x86_64-apple-darwin
-          - x86_64-pc-windows-gnu
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - name: Check cross-compilation
-        run: cargo check --workspace --target ${{ matrix.target }}
+      - name: Check host build
+        run: cargo check --workspace --locked

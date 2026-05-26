@@ -124,6 +124,7 @@ mod tests {
             security: SecurityConfig {
                 downstream_auth: "relay_key".to_string(),
                 log_secret: Some("test-relay-secret".to_string()),
+                managed_key_encryption_secret: Some("test-managed-key-secret".to_string()),
                 relay_keys: vec![RelayKeyConfig {
                     key_hash: hash_key_for_logging("mw_test_key", "test-relay-secret"),
                     enabled: true,

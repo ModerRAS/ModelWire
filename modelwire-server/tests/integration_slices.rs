@@ -31,6 +31,7 @@ fn relay_security_for(raw_key: &str) -> SecurityConfig {
     SecurityConfig {
         downstream_auth: "relay_key".to_string(),
         log_secret: Some(relay_secret.to_string()),
+        managed_key_encryption_secret: Some("test-managed-key-secret".to_string()),
         relay_keys: vec![RelayKeyConfig {
             key_hash: hash_key_for_logging(raw_key, relay_secret),
             enabled: true,
@@ -1125,6 +1126,14 @@ mod anthropic_streaming_tests {
                 || body_str.contains("\\\"Boston\\\""),
             "downstream SSE should include mapped tool input JSON fragments"
         );
+        assert!(
+            body_str.contains("\"name\":\"get_weather\""),
+            "streaming tool completion should preserve the upstream function name"
+        );
+        assert!(
+            !body_str.contains("\"name\":\"unknown_tool\""),
+            "streaming tool completion should not synthesize unknown_tool when metadata was provided"
+        );
     }
 }
 
@@ -2129,7 +2138,7 @@ mod no_fallback_after_commit_tests {
                  data: {\"response\":{\"id\":\"resp_stream_basic\",\"model\":\"gpt-upstream\",\"created_at\":1}}\n\n\
                  event: response.output_item.added\n\
                  data: {\"response_id\":\"resp_stream_basic\",\"item\":{\"type\":\"message\",\"id\":\"msg_stream_basic\",\"role\":\"assistant\",\"content\":[]}}\n\n\
-                 event: response.text.delta\n\
+                 event: response.output_text.delta\n\
                  data: {\"item_id\":\"msg_stream_basic\",\"delta\":{\"text\":\"hello\"}}\n\n\
                  event: response.completed\n\
                  data: {\"response\":{\"id\":\"resp_stream_basic\",\"output\":[]}}\n\n",
@@ -2171,7 +2180,7 @@ mod no_fallback_after_commit_tests {
             .unwrap();
         let sse = String::from_utf8_lossy(&body);
         assert!(sse.contains("event: response.created"));
-        assert!(sse.contains("event: response.text.delta"));
+        assert!(sse.contains("event: response.output_text.delta"));
         assert!(sse.contains("event: response.completed"));
     }
 
@@ -2245,7 +2254,7 @@ mod no_fallback_after_commit_tests {
              data: {\"response\":{\"id\":\"resp_stream_large\",\"model\":\"gpt-upstream\",\"created_at\":1}}\n\n"
             .to_string();
         let second_event = format!(
-            "event: response.text.delta\n\
+            "event: response.output_text.delta\n\
              data: {{\"item_id\":\"msg_stream_large\",\"delta\":{{\"text\":\"{}\"}}}}\n\n",
             large_delta
         );
@@ -2307,7 +2316,7 @@ mod no_fallback_after_commit_tests {
                  data: {\"response\":{\"id\":\"resp_upstream_secret\",\"model\":\"gpt-upstream\",\"created_at\":1}}\n\n\
                  event: response.output_item.added\n\
                  data: {\"response_id\":\"resp_upstream_secret\",\"item\":{\"type\":\"message\",\"id\":\"msg_upstream_secret\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}}\n\n\
-                 event: response.text.delta\n\
+                 event: response.output_text.delta\n\
                  data: {\"item_id\":\"msg_upstream_secret\",\"delta\":{\"text\":\"hi\"}}\n\n\
                  event: response.output_item.done\n\
                  data: {\"response_id\":\"resp_upstream_secret\",\"item\":{\"type\":\"message\",\"id\":\"msg_upstream_secret\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}}\n\n\
@@ -2358,6 +2367,41 @@ mod no_fallback_after_commit_tests {
         assert!(
             sse.contains("msg_mw_"),
             "streaming downstream SSE should use ModelWire output item IDs"
+        );
+
+        let downstream_response_id = sse
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find_map(|value| {
+                value
+                    .get("response")
+                    .and_then(|response| response.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| id.starts_with("resp_mw_"))
+                    .map(ToOwned::to_owned)
+            })
+            .expect("stream should contain downstream response id");
+        let persisted =
+            modelwire_db::repo::responses::get_response(&state.db, &downstream_response_id)
+                .await
+                .unwrap()
+                .expect("stream response should be persisted");
+        assert_eq!(
+            persisted.upstream_response_id.as_deref(),
+            Some("resp_upstream_secret"),
+            "stream persistence must retain the private upstream response handle"
+        );
+        let handle = modelwire_db::repo::responses::get_latest_upstream_handle(
+            &state.db,
+            &downstream_response_id,
+        )
+        .await
+        .unwrap()
+        .expect("stream response should persist an upstream handle");
+        assert_eq!(
+            handle.upstream_response_id.as_deref(),
+            Some("resp_upstream_secret")
         );
     }
 
@@ -2413,7 +2457,7 @@ mod no_fallback_after_commit_tests {
             .unwrap();
         let sse = String::from_utf8_lossy(&body);
         assert!(
-            sse.contains("event: response.text.delta")
+            sse.contains("event: response.output_text.delta")
                 || sse.contains("Hello")
                 || sse.contains("world"),
             "chat stream should map upstream deltas into downstream text stream"
@@ -2467,6 +2511,28 @@ mod no_fallback_after_commit_tests {
         );
         assert!(sse.contains("Hello"));
         assert!(sse.contains("world"));
+        let created_index = sse
+            .find("event: response.created")
+            .expect("created event should be present");
+        let added_index = sse
+            .find("event: response.output_item.added")
+            .expect("chat stream should synthesize output_item.added before deltas");
+        let delta_index = sse
+            .find("event: response.output_text.delta")
+            .expect("text delta should be present");
+        let done_index = sse
+            .find("event: response.output_item.done")
+            .expect("chat stream should synthesize output_item.done");
+        let completed_index = sse
+            .find("event: response.completed")
+            .expect("chat stream should synthesize response.completed");
+        assert!(
+            created_index < added_index
+                && added_index < delta_index
+                && delta_index < done_index
+                && done_index < completed_index,
+            "chat stream should expose a complete Responses SSE event sequence"
+        );
         assert!(
             !sse.contains("chatcmpl_real_stream"),
             "downstream stream must not leak Chat completion IDs"
@@ -3032,6 +3098,22 @@ mod tool_call_roundtrip_chat_tests {
             .get("call_id")
             .and_then(|v| v.as_str())
             .expect("function_call should expose call_id");
+        assert!(
+            call_id.starts_with("call_mw_"),
+            "downstream chat function_call call_id must be ModelWire-owned"
+        );
+        assert_ne!(
+            call_id, "call_upstream_1",
+            "downstream must not expose upstream chat tool call IDs"
+        );
+        assert!(
+            call_id.starts_with("call_mw_"),
+            "downstream function_call call_id must be ModelWire-owned"
+        );
+        assert_ne!(
+            call_id, "call_upstream_1",
+            "downstream must not expose upstream tool call IDs"
+        );
 
         let second_request = Request::builder()
             .method("POST")
@@ -3074,6 +3156,17 @@ mod tool_call_roundtrip_chat_tests {
                 item.get("type").and_then(|v| v.as_str()) == Some("function_call_output")
             }),
             "second upstream request should include function_call_output"
+        );
+        let upstream_tool_result = second_input
+            .iter()
+            .find(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call_output"))
+            .expect("tool result should be sent upstream");
+        assert_eq!(
+            upstream_tool_result
+                .get("call_id")
+                .and_then(serde_json::Value::as_str),
+            Some("call_upstream_1"),
+            "same-upstream Responses continuation should translate ModelWire call_id back to the private upstream call_id"
         );
     }
 
@@ -3249,6 +3342,18 @@ mod tool_call_roundtrip_chat_tests {
                         .is_some()
             }),
             "second chat request should include mapped tool result message"
+        );
+        assert!(
+            second_messages
+                .iter()
+                .filter(|message| message.get("role").and_then(|v| v.as_str()) == Some("tool"))
+                .all(|message| {
+                    message
+                        .get("tool_call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|id| id.starts_with("call_mw_"))
+                }),
+            "Chat replay should use ModelWire-owned tool IDs and keep upstream IDs private"
         );
     }
 }
@@ -4342,6 +4447,19 @@ mod state_scope_reuse_failure_tests {
         assert!(
             input.len() >= 2,
             "replay should include prior visible history plus new turn"
+        );
+        let replay_text = serde_json::to_string(input).unwrap();
+        assert!(
+            replay_text.contains("first"),
+            "replay should include the first turn user input"
+        );
+        assert!(
+            replay_text.contains("from provider a"),
+            "replay should include the first turn assistant output"
+        );
+        assert!(
+            replay_text.contains("second"),
+            "replay should include the current turn user input"
         );
     }
 

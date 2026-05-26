@@ -319,15 +319,31 @@ impl UpstreamAdapter for AnthropicAdapter {
                     UpstreamError::InvalidResponse("missing content_block".to_string())
                 })?;
                 let block_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let index = json.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
 
                 if block_type == "text" {
-                    let item_id = modelwire_core::generate_message_id();
                     Ok(Some(CanonicalEvent::OutputItemAdded {
                         response_id: "".to_string(),
                         item: modelwire_core::CanonicalOutputItem::Message {
-                            id: item_id,
+                            id: index.to_string(),
                             role: "assistant".to_string(),
                             content: vec![],
+                        },
+                    }))
+                } else if block_type == "tool_use" {
+                    let call_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let input = item
+                        .get("input")
+                        .map(|v| serde_json::to_string(v).unwrap_or_default())
+                        .unwrap_or_default();
+                    Ok(Some(CanonicalEvent::OutputItemAdded {
+                        response_id: "".to_string(),
+                        item: modelwire_core::CanonicalOutputItem::FunctionCall {
+                            id: index.to_string(),
+                            call_id: call_id.to_string(),
+                            name: name.to_string(),
+                            arguments: input,
                         },
                     }))
                 } else {
