@@ -18,6 +18,30 @@ pub async fn replace_admin_config(
     db: &DbPool,
     config: &modelwire_core::Config,
 ) -> Result<AppliedConfigCounts, sqlx::Error> {
+    replace_admin_config_with_options(
+        db,
+        config,
+        ApplyConfigOptions {
+            include_managed_api_keys: true,
+        },
+    )
+    .await
+}
+
+/// Options controlling config import persistence behavior.
+#[derive(Debug, Clone, Copy)]
+pub struct ApplyConfigOptions {
+    /// Whether to persist managed provider API key material in provider config_json.
+    /// Set to `false` for admin/runtime import paths that must avoid at-rest plaintext.
+    pub include_managed_api_keys: bool,
+}
+
+/// Replace provider/route/target tables with configurable secret persistence behavior.
+pub async fn replace_admin_config_with_options(
+    db: &DbPool,
+    config: &modelwire_core::Config,
+    options: ApplyConfigOptions,
+) -> Result<AppliedConfigCounts, sqlx::Error> {
     match db {
         DbPool::Sqlite(pool) => {
             let mut tx = pool.begin().await?;
@@ -39,6 +63,11 @@ pub async fn replace_admin_config(
                     "allow_private_ips": provider.allow_private_ips,
                     "skip_ssrf_validation": provider.skip_ssrf_validation,
                     "api_key_set": provider.api_key.is_some(),
+                    "managed_api_key": if options.include_managed_api_keys {
+                        provider.api_key.clone()
+                    } else {
+                        None
+                    },
                     "config_json": provider.config_json,
                 })
                 .to_string();
@@ -149,6 +178,11 @@ pub async fn replace_admin_config(
                     "allow_private_ips": provider.allow_private_ips,
                     "skip_ssrf_validation": provider.skip_ssrf_validation,
                     "api_key_set": provider.api_key.is_some(),
+                    "managed_api_key": if options.include_managed_api_keys {
+                        provider.api_key.clone()
+                    } else {
+                        None
+                    },
                     "config_json": provider.config_json,
                 })
                 .to_string();

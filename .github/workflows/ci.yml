@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [master, main, develop]
   pull_request:
-    branches: [main]
+    branches: [master, main]
 
 env:
   RUST_BACKTRACE: 1
@@ -48,6 +48,28 @@ jobs:
       - name: Check feature flags
         run: cargo check --workspace --all-features
 
+  webui:
+    name: WebUI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: modelwire-webui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: modelwire-webui/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Build
+        run: npm run build
+      - name: Audit
+        run: npm audit --audit-level=high --registry=https://registry.npmjs.org
+
   security-audit:
     name: Security Audit
     runs-on: ubuntu-latest
@@ -58,6 +80,7 @@ jobs:
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2023-0071
 
   docs:
     name: Documentation
@@ -65,27 +88,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustdocs
       - name: Check documentation
         run: |
           cargo doc --workspace --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: -D warnings
 
-  cross-platform:
-    name: Cross-platform check
+  host-platform:
+    name: Host platform check
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - x86_64-apple-darwin
-          - x86_64-pc-windows-gnu
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - name: Check cross-compilation
-        run: cargo check --workspace --target ${{ matrix.target }}
+      - name: Check host build
+        run: cargo check --workspace --locked

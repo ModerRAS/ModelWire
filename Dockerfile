@@ -1,7 +1,20 @@
 # =============================================================================
-# Stage 1: Build
+# Stage 1: Build WebUI
 # =============================================================================
-FROM rust:1.79-bookworm AS builder
+FROM node:22-bookworm-slim AS webui-builder
+
+WORKDIR /build/modelwire-webui
+
+COPY modelwire-webui/package.json modelwire-webui/package-lock.json ./
+RUN npm ci
+
+COPY modelwire-webui/ ./
+RUN npm run build
+
+# =============================================================================
+# Stage 2: Build Rust server
+# =============================================================================
+FROM rust:1.95-bookworm AS builder
 
 WORKDIR /build
 
@@ -19,7 +32,6 @@ COPY modelwire-adapters/ ./modelwire-adapters/
 COPY modelwire-db/ ./modelwire-db/
 COPY modelwire-archive/ ./modelwire-archive/
 COPY modelwire-server/ ./modelwire-server/
-COPY modelwire-webui/ ./modelwire-webui/
 
 # Cache cargo registry and build dependencies
 RUN mkdir -p ~/.cargo/registry/cache ~/.cargo/registry/index
@@ -32,7 +44,7 @@ RUN cargo build --release --package modelwire-server \
     --manifest-path Cargo.toml
 
 # =============================================================================
-# Stage 2: Runtime
+# Stage 3: Runtime
 # =============================================================================
 FROM debian:bookworm-slim AS runtime
 
@@ -54,7 +66,7 @@ WORKDIR /app
 
 # Copy binary from builder
 COPY --from=builder /build/target/release/modelwire-server /app/modelwire
-COPY --from=builder /build/modelwire-webui/dist /app/modelwire-webui/dist
+COPY --from=webui-builder /build/modelwire-webui/dist /app/modelwire-webui/dist
 
 # Create data directories with proper permissions
 RUN mkdir -p /app/data /app/data/archives && \

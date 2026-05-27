@@ -30,7 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres", "chrono", "uuid"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "chrono", "uuid", "derive"] }
 
 # Utilities
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
@@ -68,7 +68,7 @@ argon2 = "0.5"
 version = "0.1.0"
 edition = "2021"
 authors = ["ModelWire Team"]
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-only"
 description = "A Codex-first Responses API relay"
-repository = "https://github.com/obra/modelwire"
-rust-version = "1.79"
+repository = "https://github.com/ModerRAS/ModelWire"
+rust-version = "1.88"

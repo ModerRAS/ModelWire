@@ -189,6 +189,102 @@ fn is_blocked_metadata_hostname(host_lower: &str) -> bool {
     matches!(host_lower, "metadata.google.internal" | "metadata")
 }
 
+/// Parse host from URL for DNS-resolution checks.
+///
+/// Returns `None` when URL is malformed or has no host.
+pub fn parse_url_host(url_str: &str) -> Option<String> {
+    let url_str = url_str.trim();
+    let (_scheme, rest) = url_str.split_once("://")?;
+    let host = extract_host_from_url(rest)?;
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.trim_end_matches('.').to_ascii_lowercase())
+}
+
+/// Whether this host requires DNS-resolution checks.
+///
+/// IP-literal hosts are already covered by `validate_provider_url`.
+pub fn host_requires_dns_resolution(host: &str) -> bool {
+    IpAddr::from_str(host).is_err()
+}
+
+/// Validate a resolved IP address from DNS lookup for provider URLs.
+pub fn validate_resolved_ip(ip: IpAddr, allow_private_ips: bool) -> SsrfValidationResult {
+    if ip.is_loopback() {
+        return if allow_private_ips {
+            SsrfValidationResult::Safe
+        } else {
+            SsrfValidationResult::Blocked {
+                reason: "Resolved to loopback address",
+            }
+        };
+    }
+
+    if let IpAddr::V4(ipv4) = ip {
+        if ipv4.is_private() {
+            return if allow_private_ips {
+                SsrfValidationResult::Safe
+            } else {
+                SsrfValidationResult::Blocked {
+                    reason: "Resolved to private IPv4 address",
+                }
+            };
+        }
+        if ipv4.is_link_local() {
+            return SsrfValidationResult::Blocked {
+                reason: "Resolved to link-local IPv4 address",
+            };
+        }
+        let octets = ipv4.octets();
+        if octets[0] == 169 && octets[1] == 254 {
+            return SsrfValidationResult::Blocked {
+                reason: "Resolved to metadata IPv4 address",
+            };
+        }
+    }
+
+    if let IpAddr::V6(ipv6) = ip {
+        let seg0 = ipv6.segments()[0];
+        if seg0 == 0xfc00 || seg0 == 0xfd00 {
+            return if allow_private_ips {
+                SsrfValidationResult::Safe
+            } else {
+                SsrfValidationResult::Blocked {
+                    reason: "Resolved to private IPv6 address",
+                }
+            };
+        }
+        if seg0 == 0xfe80 {
+            return SsrfValidationResult::Blocked {
+                reason: "Resolved to link-local IPv6 address",
+            };
+        }
+    }
+
+    if ip.is_multicast() {
+        return SsrfValidationResult::Blocked {
+            reason: "Resolved to multicast address",
+        };
+    }
+    if ip.is_unspecified() {
+        return SsrfValidationResult::Blocked {
+            reason: "Resolved to unspecified address",
+        };
+    }
+
+    SsrfValidationResult::Safe
+}
+
+/// Validate final URL after redirects (hostname + resolved IP checks should already
+/// have run per hop where applicable).
+pub fn validate_redirect_target_url(
+    url: &reqwest::Url,
+    allow_private_ips: bool,
+) -> SsrfValidationResult {
+    validate_provider_url_for_provider(url.as_str(), allow_private_ips)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +386,44 @@ mod tests {
         ));
         assert!(matches!(
             validate_provider_url_for_provider("https://api.openai.com/v1", true),
+            SsrfValidationResult::Safe
+        ));
+    }
+
+    #[test]
+    fn test_parse_url_host_and_dns_resolution_need() {
+        assert_eq!(
+            parse_url_host("https://api.openai.com/v1").as_deref(),
+            Some("api.openai.com")
+        );
+        assert_eq!(
+            parse_url_host("https://[2001:db8::1]:443/v1").as_deref(),
+            Some("2001:db8::1")
+        );
+        assert!(host_requires_dns_resolution("api.openai.com"));
+        assert!(!host_requires_dns_resolution("127.0.0.1"));
+    }
+
+    #[test]
+    fn test_validate_resolved_ip_private_and_metadata() {
+        let private = IpAddr::from_str("10.0.0.5").unwrap();
+        let metadata = IpAddr::from_str("169.254.169.254").unwrap();
+        let public = IpAddr::from_str("1.1.1.1").unwrap();
+
+        assert!(matches!(
+            validate_resolved_ip(private, false),
+            SsrfValidationResult::Blocked { .. }
+        ));
+        assert!(matches!(
+            validate_resolved_ip(private, true),
+            SsrfValidationResult::Safe
+        ));
+        assert!(matches!(
+            validate_resolved_ip(metadata, false),
+            SsrfValidationResult::Blocked { .. }
+        ));
+        assert!(matches!(
+            validate_resolved_ip(public, false),
             SsrfValidationResult::Safe
         ));
     }

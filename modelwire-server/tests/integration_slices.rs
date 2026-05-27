@@ -12,17 +12,34 @@
 
 use axum::{body::Body, http::Request};
 use modelwire_core::{
-    ArchiveConfig, Config, ProviderConfig, RouteConfig, SecurityConfig, ServerConfig, TargetConfig,
+    hash_key_for_logging, ArchiveConfig, Config, ProviderConfig, RelayKeyConfig, RouteConfig,
+    SecurityConfig, ServerConfig, TargetConfig,
 };
 use modelwire_db::Database;
 use modelwire_server::{server::build_router, ServerState};
 use serde_json::json;
 use std::sync::Arc;
+use std::time::Instant;
 use tower::util::ServiceExt;
 use wiremock::{
     matchers::{method, path},
     Mock, MockServer, ResponseTemplate,
 };
+
+fn relay_security_for(raw_key: &str) -> SecurityConfig {
+    let relay_secret = "test-relay-secret";
+    SecurityConfig {
+        downstream_auth: "relay_key".to_string(),
+        log_secret: Some(relay_secret.to_string()),
+        managed_key_encryption_secret: Some("test-managed-key-secret".to_string()),
+        relay_keys: vec![RelayKeyConfig {
+            key_hash: hash_key_for_logging(raw_key, relay_secret),
+            enabled: true,
+            ..RelayKeyConfig::default()
+        }],
+        ..SecurityConfig::default()
+    }
+}
 
 // ============================================================================
 // Test 1: chat_nonstream_nonstreaming_text
@@ -1109,6 +1126,14 @@ mod anthropic_streaming_tests {
                 || body_str.contains("\\\"Boston\\\""),
             "downstream SSE should include mapped tool input JSON fragments"
         );
+        assert!(
+            body_str.contains("\"name\":\"get_weather\""),
+            "streaming tool completion should preserve the upstream function name"
+        );
+        assert!(
+            !body_str.contains("\"name\":\"unknown_tool\""),
+            "streaming tool completion should not synthesize unknown_tool when metadata was provided"
+        );
     }
 }
 
@@ -1419,7 +1444,7 @@ mod state_scope_reuse_tests {
                 upstream_timeout_secs: 5,
                 ..ServerConfig::default()
             },
-            security: SecurityConfig::default(),
+            security: relay_security_for("mw_test_key"),
             archive: ArchiveConfig::default(),
             providers: vec![
                 ProviderConfig {
@@ -1501,7 +1526,7 @@ mod state_scope_reuse_tests {
             probe_locks: dashmap::DashMap::new(),
             key_limiter_counters: dashmap::DashMap::new(),
             ip_limiter_counters: dashmap::DashMap::new(),
-            archive_writer: tokio::sync::Mutex::new(None),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         });
         let app = build_router(Arc::clone(&state));
 
@@ -2043,7 +2068,11 @@ mod fallback_429_tests {
         let sse = String::from_utf8_lossy(&body);
         assert!(sse.contains("event: response.created"));
         assert!(sse.contains("event: response.completed"));
-        assert!(sse.contains("resp_fallback_stream"));
+        assert!(sse.contains("resp_mw_"));
+        assert!(
+            !sse.contains("resp_fallback_stream"),
+            "fallback stream must not expose upstream response id downstream"
+        );
     }
 }
 
@@ -2109,7 +2138,7 @@ mod no_fallback_after_commit_tests {
                  data: {\"response\":{\"id\":\"resp_stream_basic\",\"model\":\"gpt-upstream\",\"created_at\":1}}\n\n\
                  event: response.output_item.added\n\
                  data: {\"response_id\":\"resp_stream_basic\",\"item\":{\"type\":\"message\",\"id\":\"msg_stream_basic\",\"role\":\"assistant\",\"content\":[]}}\n\n\
-                 event: response.text.delta\n\
+                 event: response.output_text.delta\n\
                  data: {\"item_id\":\"msg_stream_basic\",\"delta\":{\"text\":\"hello\"}}\n\n\
                  event: response.completed\n\
                  data: {\"response\":{\"id\":\"resp_stream_basic\",\"output\":[]}}\n\n",
@@ -2151,8 +2180,229 @@ mod no_fallback_after_commit_tests {
             .unwrap();
         let sse = String::from_utf8_lossy(&body);
         assert!(sse.contains("event: response.created"));
-        assert!(sse.contains("event: response.text.delta"));
+        assert!(sse.contains("event: response.output_text.delta"));
         assert!(sse.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn streaming_first_sse_arrives_before_upstream_completion() {
+        let first_base = spawn_delayed_sse_upstream(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(900),
+            vec![
+                "event: response.created\n\
+                 data: {\"response\":{\"id\":\"resp_stream_early\",\"model\":\"gpt-upstream\",\"created_at\":1}}\n\n"
+                    .to_string(),
+                "event: response.completed\n\
+                 data: {\"response\":{\"id\":\"resp_stream_early\",\"output\":[]}}\n\n"
+                    .to_string(),
+            ],
+        )
+        .await;
+
+        let state = Arc::new(build_test_state(&first_base).await);
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "codex-main",
+                    "input": "early sse",
+                    "stream": true
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let start = Instant::now();
+        let mut body_stream = response.into_body().into_data_stream();
+        let first = futures::StreamExt::next(&mut body_stream)
+            .await
+            .expect("first frame should arrive")
+            .expect("first frame should be ok");
+        let elapsed = start.elapsed();
+        let first_text = String::from_utf8_lossy(&first);
+        assert!(
+            first_text.contains("event: response.created"),
+            "first streamed frame should contain response.created"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(700),
+            "first downstream SSE frame should arrive before upstream completion delay"
+        );
+
+        let mut merged = first.to_vec();
+        while let Some(next) = futures::StreamExt::next(&mut body_stream).await {
+            let bytes = next.expect("stream chunk should be ok");
+            merged.extend_from_slice(&bytes);
+        }
+        let all = String::from_utf8_lossy(&merged);
+        assert!(all.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn streaming_large_response_does_not_buffer_entire_body() {
+        let large_delta = "x".repeat(64 * 1024);
+        let first_event = "event: response.created\n\
+             data: {\"response\":{\"id\":\"resp_stream_large\",\"model\":\"gpt-upstream\",\"created_at\":1}}\n\n"
+            .to_string();
+        let second_event = format!(
+            "event: response.output_text.delta\n\
+             data: {{\"item_id\":\"msg_stream_large\",\"delta\":{{\"text\":\"{}\"}}}}\n\n",
+            large_delta
+        );
+        let third_event = "event: response.completed\n\
+             data: {\"response\":{\"id\":\"resp_stream_large\",\"output\":[]}}\n\n"
+            .to_string();
+
+        let first_base = spawn_delayed_sse_upstream(
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(700),
+            vec![first_event, second_event, third_event],
+        )
+        .await;
+
+        let state = Arc::new(build_test_state(&first_base).await);
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "codex-main",
+                    "input": "large stream",
+                    "stream": true
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let mut body_stream = response.into_body().into_data_stream();
+
+        let first_start = Instant::now();
+        let first = futures::StreamExt::next(&mut body_stream)
+            .await
+            .expect("first frame should arrive")
+            .expect("first frame should be ok");
+        let first_elapsed = first_start.elapsed();
+        assert!(
+            first_elapsed < std::time::Duration::from_millis(500),
+            "first frame should be emitted quickly without waiting for large trailing chunks"
+        );
+        let first_text = String::from_utf8_lossy(&first);
+        assert!(first_text.contains("event: response.created"));
+    }
+
+    #[tokio::test]
+    async fn streaming_downstream_sse_uses_modelwire_owned_ids() {
+        let upstream = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "event: response.created\n\
+                 data: {\"response\":{\"id\":\"resp_upstream_secret\",\"model\":\"gpt-upstream\",\"created_at\":1}}\n\n\
+                 event: response.output_item.added\n\
+                 data: {\"response_id\":\"resp_upstream_secret\",\"item\":{\"type\":\"message\",\"id\":\"msg_upstream_secret\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}}\n\n\
+                 event: response.output_text.delta\n\
+                 data: {\"item_id\":\"msg_upstream_secret\",\"delta\":{\"text\":\"hi\"}}\n\n\
+                 event: response.output_item.done\n\
+                 data: {\"response_id\":\"resp_upstream_secret\",\"item\":{\"type\":\"message\",\"id\":\"msg_upstream_secret\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}}\n\n\
+                 event: response.completed\n\
+                 data: {\"response\":{\"id\":\"resp_upstream_secret\",\"output\":[{\"type\":\"message\",\"id\":\"msg_upstream_secret\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+            ))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(build_test_state(&upstream.uri()).await);
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "codex-main",
+                    "input": "stream ids",
+                    "stream": true
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let sse = String::from_utf8_lossy(&body);
+
+        assert!(
+            !sse.contains("resp_upstream_secret"),
+            "streaming downstream SSE must not expose upstream response IDs"
+        );
+        assert!(
+            !sse.contains("msg_upstream_secret"),
+            "streaming downstream SSE must not expose upstream output item IDs"
+        );
+        assert!(
+            sse.contains("resp_mw_"),
+            "streaming downstream SSE should use ModelWire response IDs"
+        );
+        assert!(
+            sse.contains("msg_mw_"),
+            "streaming downstream SSE should use ModelWire output item IDs"
+        );
+
+        let downstream_response_id = sse
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find_map(|value| {
+                value
+                    .get("response")
+                    .and_then(|response| response.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| id.starts_with("resp_mw_"))
+                    .map(ToOwned::to_owned)
+            })
+            .expect("stream should contain downstream response id");
+        let persisted =
+            modelwire_db::repo::responses::get_response(&state.db, &downstream_response_id)
+                .await
+                .unwrap()
+                .expect("stream response should be persisted");
+        assert_eq!(
+            persisted.upstream_response_id.as_deref(),
+            Some("resp_upstream_secret"),
+            "stream persistence must retain the private upstream response handle"
+        );
+        let handle = modelwire_db::repo::responses::get_latest_upstream_handle(
+            &state.db,
+            &downstream_response_id,
+        )
+        .await
+        .unwrap()
+        .expect("stream response should persist an upstream handle");
+        assert_eq!(
+            handle.upstream_response_id.as_deref(),
+            Some("resp_upstream_secret")
+        );
     }
 
     /// Equivalent to minimum-slice `chat_stream_text_basic`.
@@ -2207,10 +2457,85 @@ mod no_fallback_after_commit_tests {
             .unwrap();
         let sse = String::from_utf8_lossy(&body);
         assert!(
-            sse.contains("event: response.text.delta")
+            sse.contains("event: response.output_text.delta")
                 || sse.contains("Hello")
                 || sse.contains("world"),
             "chat stream should map upstream deltas into downstream text stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_stream_real_completions_sse_without_event_names() {
+        let upstream = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "data: {\"id\":\"chatcmpl_real_stream\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+                 data: {\"id\":\"chatcmpl_real_stream\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n\
+                 data: {\"id\":\"chatcmpl_real_stream\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n\
+                 data: [DONE]\n\n",
+            ))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(build_chat_test_state(&upstream.uri()).await);
+        let app = build_router(Arc::clone(&state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer mw_test_key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "chat-gpt-4",
+                    "input": "stream chat real",
+                    "stream": true
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let sse = String::from_utf8_lossy(&body);
+
+        assert!(
+            sse.contains("event: response.created"),
+            "chat stream should synthesize downstream response.created"
+        );
+        assert!(sse.contains("Hello"));
+        assert!(sse.contains("world"));
+        let created_index = sse
+            .find("event: response.created")
+            .expect("created event should be present");
+        let added_index = sse
+            .find("event: response.output_item.added")
+            .expect("chat stream should synthesize output_item.added before deltas");
+        let delta_index = sse
+            .find("event: response.output_text.delta")
+            .expect("text delta should be present");
+        let done_index = sse
+            .find("event: response.output_item.done")
+            .expect("chat stream should synthesize output_item.done");
+        let completed_index = sse
+            .find("event: response.completed")
+            .expect("chat stream should synthesize response.completed");
+        assert!(
+            created_index < added_index
+                && added_index < delta_index
+                && delta_index < done_index
+                && done_index < completed_index,
+            "chat stream should expose a complete Responses SSE event sequence"
+        );
+        assert!(
+            !sse.contains("chatcmpl_real_stream"),
+            "downstream stream must not leak Chat completion IDs"
         );
     }
 
@@ -2531,16 +2856,13 @@ mod auth_header_rewrite_tests {
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(move |req: &wiremock::Request| {
-                let auth = req
-                    .headers
-                    .iter()
-                    .find_map(|(k, v)| {
-                        if k.as_str().eq_ignore_ascii_case("authorization") {
-                            Some(v.to_str().unwrap_or("").to_string())
-                        } else {
-                            None
-                        }
-                    });
+                let auth = req.headers.iter().find_map(|(k, v)| {
+                    if k.as_str().eq_ignore_ascii_case("authorization") {
+                        Some(v.to_str().unwrap_or("").to_string())
+                    } else {
+                        None
+                    }
+                });
                 *captured_auth_clone.lock().unwrap() = auth;
 
                 ResponseTemplate::new(200).set_body_json(json!({
@@ -2561,6 +2883,8 @@ mod auth_header_rewrite_tests {
             .await;
 
         let mut raw_state = build_chat_test_state(&upstream.uri()).await;
+        raw_state.config.security.downstream_auth = "passthrough".to_string();
+        raw_state.config.security.allow_passthrough_keys = true;
         raw_state.config.providers[0].auth_mode = "pass_authorization".to_string();
         let state = Arc::new(raw_state);
         let app = build_router(Arc::clone(&state));
@@ -2568,7 +2892,7 @@ mod auth_header_rewrite_tests {
         let request = Request::builder()
             .method("POST")
             .uri("/v1/responses")
-            .header("authorization", "Bearer mw_test_key")
+            .header("authorization", "Bearer sk-upstream-openai")
             .header("content-type", "application/json")
             .body(Body::from(
                 json!({
@@ -2587,7 +2911,7 @@ mod auth_header_rewrite_tests {
             .unwrap()
             .clone()
             .expect("upstream authorization should be present");
-        assert_eq!(auth, "Bearer mw_test_key");
+        assert_eq!(auth, "Bearer sk-upstream-openai");
     }
 
     /// Verifies downstream Authorization is rewritten for Anthropic-compatible
@@ -2634,6 +2958,8 @@ mod auth_header_rewrite_tests {
             .await;
 
         let mut raw_state = build_anthropic_test_state(&upstream.uri()).await;
+        raw_state.config.security.downstream_auth = "passthrough".to_string();
+        raw_state.config.security.allow_passthrough_keys = true;
         raw_state.config.providers[0].auth_mode = "pass_authorization".to_string();
         let state = Arc::new(raw_state);
         let app = build_router(Arc::clone(&state));
@@ -2641,7 +2967,7 @@ mod auth_header_rewrite_tests {
         let request = Request::builder()
             .method("POST")
             .uri("/v1/responses")
-            .header("authorization", "Bearer mw_test_key")
+            .header("authorization", "Bearer sk-upstream-anthropic")
             .header("content-type", "application/json")
             .body(Body::from(
                 json!({
@@ -2660,7 +2986,7 @@ mod auth_header_rewrite_tests {
             .unwrap()
             .clone()
             .expect("x-api-key should be present");
-        assert_eq!(x_api_key, "mw_test_key");
+        assert_eq!(x_api_key, "sk-upstream-anthropic");
         assert!(
             captured_authz.lock().unwrap().is_none(),
             "anthropic upstream request should not forward Authorization header"
@@ -2772,6 +3098,22 @@ mod tool_call_roundtrip_chat_tests {
             .get("call_id")
             .and_then(|v| v.as_str())
             .expect("function_call should expose call_id");
+        assert!(
+            call_id.starts_with("call_mw_"),
+            "downstream chat function_call call_id must be ModelWire-owned"
+        );
+        assert_ne!(
+            call_id, "call_upstream_1",
+            "downstream must not expose upstream chat tool call IDs"
+        );
+        assert!(
+            call_id.starts_with("call_mw_"),
+            "downstream function_call call_id must be ModelWire-owned"
+        );
+        assert_ne!(
+            call_id, "call_upstream_1",
+            "downstream must not expose upstream tool call IDs"
+        );
 
         let second_request = Request::builder()
             .method("POST")
@@ -2796,7 +3138,11 @@ mod tool_call_roundtrip_chat_tests {
         assert_eq!(second_response.status(), axum::http::StatusCode::OK);
 
         let captured = captured_requests.lock().unwrap().clone();
-        assert_eq!(captured.len(), 2, "two upstream responses requests expected");
+        assert_eq!(
+            captured.len(),
+            2,
+            "two upstream responses requests expected"
+        );
         assert!(
             captured[0].get("tools").is_some(),
             "first upstream request should include tools"
@@ -2810,6 +3156,17 @@ mod tool_call_roundtrip_chat_tests {
                 item.get("type").and_then(|v| v.as_str()) == Some("function_call_output")
             }),
             "second upstream request should include function_call_output"
+        );
+        let upstream_tool_result = second_input
+            .iter()
+            .find(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call_output"))
+            .expect("tool result should be sent upstream");
+        assert_eq!(
+            upstream_tool_result
+                .get("call_id")
+                .and_then(serde_json::Value::as_str),
+            Some("call_upstream_1"),
+            "same-upstream Responses continuation should translate ModelWire call_id back to the private upstream call_id"
         );
     }
 
@@ -2986,6 +3343,18 @@ mod tool_call_roundtrip_chat_tests {
             }),
             "second chat request should include mapped tool result message"
         );
+        assert!(
+            second_messages
+                .iter()
+                .filter(|message| message.get("role").and_then(|v| v.as_str()) == Some("tool"))
+                .all(|message| {
+                    message
+                        .get("tool_call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|id| id.starts_with("call_mw_"))
+                }),
+            "Chat replay should use ModelWire-owned tool IDs and keep upstream IDs private"
+        );
     }
 }
 
@@ -2997,7 +3366,7 @@ async fn build_state_with_two_targets(first_base_url: &str, second_base_url: &st
             upstream_timeout_secs: 5,
             ..ServerConfig::default()
         },
-        security: SecurityConfig::default(),
+        security: relay_security_for("mw_test_key"),
         archive: ArchiveConfig::default(),
         providers: vec![
             ProviderConfig {
@@ -3073,7 +3442,7 @@ async fn build_state_with_two_targets(first_base_url: &str, second_base_url: &st
         probe_locks: dashmap::DashMap::new(),
         key_limiter_counters: dashmap::DashMap::new(),
         ip_limiter_counters: dashmap::DashMap::new(),
-        archive_writer: tokio::sync::Mutex::new(None),
+        archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     }
 }
 
@@ -3088,7 +3457,7 @@ async fn build_state_with_three_targets(
             upstream_timeout_secs: 5,
             ..ServerConfig::default()
         },
-        security: SecurityConfig::default(),
+        security: relay_security_for("mw_test_key"),
         archive: ArchiveConfig::default(),
         providers: vec![
             ProviderConfig {
@@ -3190,7 +3559,7 @@ async fn build_state_with_three_targets(
         probe_locks: dashmap::DashMap::new(),
         key_limiter_counters: dashmap::DashMap::new(),
         ip_limiter_counters: dashmap::DashMap::new(),
-        archive_writer: tokio::sync::Mutex::new(None),
+        archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     }
 }
 
@@ -3205,7 +3574,7 @@ async fn build_test_state(upstream_base_url: &str) -> ServerState {
             upstream_timeout_secs: 5,
             ..ServerConfig::default()
         },
-        security: SecurityConfig::default(),
+        security: relay_security_for("mw_test_key"),
         archive: ArchiveConfig::default(),
         providers: vec![ProviderConfig {
             id: "test-provider".to_string(),
@@ -3251,7 +3620,7 @@ async fn build_test_state(upstream_base_url: &str) -> ServerState {
         probe_locks: dashmap::DashMap::new(),
         key_limiter_counters: dashmap::DashMap::new(),
         ip_limiter_counters: dashmap::DashMap::new(),
-        archive_writer: tokio::sync::Mutex::new(None),
+        archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     }
 }
 
@@ -3262,7 +3631,7 @@ async fn build_chat_test_state(upstream_base_url: &str) -> ServerState {
             upstream_timeout_secs: 5,
             ..ServerConfig::default()
         },
-        security: SecurityConfig::default(),
+        security: relay_security_for("mw_test_key"),
         archive: ArchiveConfig::default(),
         providers: vec![ProviderConfig {
             id: "chat-provider".to_string(),
@@ -3308,7 +3677,7 @@ async fn build_chat_test_state(upstream_base_url: &str) -> ServerState {
         probe_locks: dashmap::DashMap::new(),
         key_limiter_counters: dashmap::DashMap::new(),
         ip_limiter_counters: dashmap::DashMap::new(),
-        archive_writer: tokio::sync::Mutex::new(None),
+        archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     }
 }
 
@@ -3319,7 +3688,7 @@ async fn build_anthropic_test_state(upstream_base_url: &str) -> ServerState {
             upstream_timeout_secs: 5,
             ..ServerConfig::default()
         },
-        security: SecurityConfig::default(),
+        security: relay_security_for("mw_test_key"),
         archive: ArchiveConfig::default(),
         providers: vec![ProviderConfig {
             id: "anthropic-provider".to_string(),
@@ -3365,7 +3734,7 @@ async fn build_anthropic_test_state(upstream_base_url: &str) -> ServerState {
         probe_locks: dashmap::DashMap::new(),
         key_limiter_counters: dashmap::DashMap::new(),
         ip_limiter_counters: dashmap::DashMap::new(),
-        archive_writer: tokio::sync::Mutex::new(None),
+        archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     }
 }
 
@@ -3376,7 +3745,7 @@ async fn build_state_scope_test_state(upstream_base_url: &str) -> ServerState {
             upstream_timeout_secs: 5,
             ..ServerConfig::default()
         },
-        security: SecurityConfig::default(),
+        security: relay_security_for("mw_test_key"),
         archive: ArchiveConfig::default(),
         providers: vec![ProviderConfig {
             id: "reuse-provider".to_string(),
@@ -3422,7 +3791,7 @@ async fn build_state_scope_test_state(upstream_base_url: &str) -> ServerState {
         probe_locks: dashmap::DashMap::new(),
         key_limiter_counters: dashmap::DashMap::new(),
         ip_limiter_counters: dashmap::DashMap::new(),
-        archive_writer: tokio::sync::Mutex::new(None),
+        archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     }
 }
 
@@ -3434,7 +3803,7 @@ async fn build_state_with_db(db_path: &std::path::Path, upstream_url: &str) -> S
             upstream_timeout_secs: 5,
             ..ServerConfig::default()
         },
-        security: SecurityConfig::default(),
+        security: relay_security_for("mw_test_key"),
         archive: ArchiveConfig::default(),
         providers: vec![ProviderConfig {
             id: "restart-provider".to_string(),
@@ -3521,8 +3890,56 @@ async fn build_state_with_db(db_path: &std::path::Path, upstream_url: &str) -> S
         probe_locks: dashmap::DashMap::new(),
         key_limiter_counters: dashmap::DashMap::new(),
         ip_limiter_counters: dashmap::DashMap::new(),
-        archive_writer: tokio::sync::Mutex::new(None),
+        archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     }
+}
+
+async fn spawn_delayed_sse_upstream(
+    first_chunk_delay: std::time::Duration,
+    between_chunks_delay: std::time::Duration,
+    chunks: Vec<String>,
+) -> String {
+    use axum::{body::Body, http::header::CONTENT_TYPE, routing::post, Router};
+    use bytes::Bytes;
+    use std::convert::Infallible;
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let chunks = Arc::new(chunks);
+    let app = Router::new().route(
+        "/responses",
+        post({
+            let chunks = Arc::clone(&chunks);
+            move || {
+                let chunks = Arc::clone(&chunks);
+                async move {
+                    let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(16);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(first_chunk_delay).await;
+                        for (idx, chunk) in chunks.iter().enumerate() {
+                            if tx.send(Ok(Bytes::from(chunk.clone()))).await.is_err() {
+                                return;
+                            }
+                            if idx + 1 < chunks.len() && !between_chunks_delay.is_zero() {
+                                tokio::time::sleep(between_chunks_delay).await;
+                            }
+                        }
+                    });
+                    (
+                        [(CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(ReceiverStream::new(rx)),
+                    )
+                }
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
 }
 
 // ============================================================================
@@ -3888,7 +4305,7 @@ mod state_scope_reuse_failure_tests {
                 upstream_timeout_secs: 5,
                 ..ServerConfig::default()
             },
-            security: SecurityConfig::default(),
+            security: relay_security_for("mw_test_key"),
             archive: ArchiveConfig::default(),
             providers: vec![
                 ProviderConfig {
@@ -3969,7 +4386,7 @@ mod state_scope_reuse_failure_tests {
             probe_locks: dashmap::DashMap::new(),
             key_limiter_counters: dashmap::DashMap::new(),
             ip_limiter_counters: dashmap::DashMap::new(),
-            archive_writer: tokio::sync::Mutex::new(None),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         });
         let app = build_router(Arc::clone(&state));
 
@@ -4030,6 +4447,19 @@ mod state_scope_reuse_failure_tests {
         assert!(
             input.len() >= 2,
             "replay should include prior visible history plus new turn"
+        );
+        let replay_text = serde_json::to_string(input).unwrap();
+        assert!(
+            replay_text.contains("first"),
+            "replay should include the first turn user input"
+        );
+        assert!(
+            replay_text.contains("from provider a"),
+            "replay should include the first turn assistant output"
+        );
+        assert!(
+            replay_text.contains("second"),
+            "replay should include the current turn user input"
         );
     }
 
@@ -4310,7 +4740,7 @@ mod probe_cache_tests {
                 upstream_timeout_secs: 5,
                 ..ServerConfig::default()
             },
-            security: SecurityConfig::default(),
+            security: relay_security_for("mw_test_key"),
             archive: ArchiveConfig::default(),
             providers: vec![ProviderConfig {
                 id: "probe-provider".to_string(),
@@ -4378,7 +4808,7 @@ mod probe_cache_tests {
             probe_locks: dashmap::DashMap::new(),
             key_limiter_counters: dashmap::DashMap::new(),
             ip_limiter_counters: dashmap::DashMap::new(),
-            archive_writer: tokio::sync::Mutex::new(None),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         });
         let app = build_router(Arc::clone(&state));
 
@@ -4452,7 +4882,7 @@ mod probe_cache_tests {
                 upstream_timeout_secs: 5,
                 ..ServerConfig::default()
             },
-            security: SecurityConfig::default(),
+            security: relay_security_for("mw_test_key"),
             archive: ArchiveConfig::default(),
             providers: vec![ProviderConfig {
                 id: "shared-provider".to_string(),
@@ -4520,7 +4950,7 @@ mod probe_cache_tests {
             probe_locks: dashmap::DashMap::new(),
             key_limiter_counters: dashmap::DashMap::new(),
             ip_limiter_counters: dashmap::DashMap::new(),
-            archive_writer: tokio::sync::Mutex::new(None),
+            archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         });
         let app = build_router(Arc::clone(&state));
 

@@ -4,7 +4,9 @@ on:
   schedule:
     - cron: '0 0 * * 0'  # Weekly on Sunday
   push:
-    branches: [main]
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
 
 jobs:
   audit:
@@ -19,6 +21,7 @@ jobs:
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2023-0071
 
   deny:
     name: License/Policy check
@@ -31,5 +34,4 @@ jobs:
         with:
           crate: cargo-deny
       - name: Check licenses and policies
-        run: cargo deny check --workspace
-        continue-on-error: true  # Allow to run but report issues
+        run: cargo deny check

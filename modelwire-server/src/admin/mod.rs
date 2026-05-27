@@ -1,15 +1,19 @@
 //! Admin API endpoints.
 
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Extension, Path, State},
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, patch, post},
     Json, Router,
 };
+use modelwire_archive::redact::redact_json;
 use modelwire_core::canonical::WireApi;
+use modelwire_core::hash_key_for_logging;
 use modelwire_core::ssrf::{validate_provider_url_for_provider, SsrfValidationResult};
-use modelwire_db::repo::config_apply::replace_admin_config;
+use modelwire_db::repo::admin_audit::{store_admin_audit_event, AdminAuditInsert};
+use modelwire_db::repo::config_apply::{replace_admin_config_with_options, ApplyConfigOptions};
+use modelwire_db::repo::logs::store_log;
 use modelwire_db::repo::logs::{count_logs as count_log_rows, list_logs as list_log_rows};
 use modelwire_db::repo::probes::{clear_probe_results, list_probe_results as list_probe_rows};
 use modelwire_db::repo::providers::{
@@ -29,6 +33,8 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::error::error_response_to_response;
+use crate::middleware::request_id::RequestIdExt;
+use crate::secrets::encrypt_managed_key;
 use crate::ServerState;
 use modelwire_core::error::{Error, ErrorKind};
 
@@ -77,6 +83,8 @@ async fn list_providers(state: State<Arc<ServerState>>) -> Json<Vec<serde_json::
 
 async fn create_provider(
     state: State<Arc<ServerState>>,
+    Extension(request_id): Extension<RequestIdExt>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let provider = match serde_json::from_value::<modelwire_core::ProviderConfig>(body) {
@@ -111,10 +119,39 @@ async fn create_provider(
         return error_response_to_response(error.to_response());
     }
 
+    let managed_api_key = if provider.auth_mode == "managed" {
+        match provider.api_key.as_deref() {
+            Some(plaintext) => {
+                let Some(secret) = state
+                    .config
+                    .security
+                    .managed_key_encryption_secret
+                    .as_deref()
+                else {
+                    return error_response_to_response(
+                        Error::new(
+                            ErrorKind::InternalError,
+                            "managed_key_encryption_secret is required for managed provider keys",
+                        )
+                        .to_response(),
+                    );
+                };
+                match encrypt_managed_key(plaintext, secret) {
+                    Ok(ciphertext) => Some(ciphertext),
+                    Err(error) => return error_response_to_response(error.to_response()),
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let config_json = serde_json::json!({
         "allow_private_ips": provider.allow_private_ips,
         "skip_ssrf_validation": provider.skip_ssrf_validation,
         "api_key_set": provider.api_key.is_some(),
+        "managed_api_key": managed_api_key,
         "config_json": provider.config_json,
     })
     .to_string();
@@ -137,12 +174,31 @@ async fn create_provider(
         );
     }
 
+    write_admin_audit_event(
+        state.as_ref(),
+        request_id.get_id(),
+        &admin_actor_hash(state.as_ref(), &headers),
+        "provider_create",
+        "provider",
+        &provider.id,
+        &to_redacted_diff_json(serde_json::Value::Null, serde_json::json!(provider)),
+    )
+    .await;
+
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
             "id": provider.id,
             "status": "created",
-            "provider": provider,
+            "provider": serialize_provider_record(&ProviderRecord {
+                id: provider.id,
+                name: provider.name,
+                base_url: provider.base_url,
+                auth_mode: provider.auth_mode,
+                default_wire_api: provider.default_wire_api,
+                state_scope: provider.state_scope,
+                config_json,
+            }),
         })),
     )
         .into_response()
@@ -170,6 +226,8 @@ async fn get_provider(state: State<Arc<ServerState>>, Path(id): Path<String>) ->
 
 async fn update_provider(
     state: State<Arc<ServerState>>,
+    Extension(request_id): Extension<RequestIdExt>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -253,10 +311,42 @@ async fn update_provider(
         return error_response_to_response(error.to_response());
     }
 
+    let managed_api_key = if candidate.auth_mode == "managed" {
+        match candidate.api_key.as_deref() {
+            Some(plaintext) => {
+                let Some(secret) = state
+                    .config
+                    .security
+                    .managed_key_encryption_secret
+                    .as_deref()
+                else {
+                    return error_response_to_response(
+                        Error::new(
+                            ErrorKind::InternalError,
+                            "managed_key_encryption_secret is required for managed provider keys",
+                        )
+                        .to_response(),
+                    );
+                };
+                match encrypt_managed_key(plaintext, secret) {
+                    Ok(ciphertext) => Some(ciphertext),
+                    Err(error) => return error_response_to_response(error.to_response()),
+                }
+            }
+            None => serde_json::from_str::<serde_json::Value>(&existing.config_json)
+                .ok()
+                .and_then(|value| value.get("managed_api_key").cloned())
+                .and_then(|value| value.as_str().map(ToOwned::to_owned)),
+        }
+    } else {
+        None
+    };
+
     let config_json = serde_json::json!({
         "allow_private_ips": candidate.allow_private_ips,
         "skip_ssrf_validation": candidate.skip_ssrf_validation,
         "api_key_set": candidate.api_key.is_some(),
+        "managed_api_key": managed_api_key,
         "config_json": candidate.config_json,
     })
     .to_string();
@@ -291,12 +381,42 @@ async fn update_provider(
         }
     }
 
+    write_admin_audit_event(
+        state.as_ref(),
+        request_id.get_id(),
+        &admin_actor_hash(state.as_ref(), &headers),
+        "provider_update",
+        "provider",
+        &id,
+        &to_redacted_diff_json(
+            serialize_provider_record(&existing),
+            serialize_provider_record(&ProviderRecord {
+                id: candidate.id.clone(),
+                name: candidate.name.clone(),
+                base_url: candidate.base_url.clone(),
+                auth_mode: candidate.auth_mode.clone(),
+                default_wire_api: candidate.default_wire_api.clone(),
+                state_scope: candidate.state_scope.clone(),
+                config_json: config_json.clone(),
+            }),
+        ),
+    )
+    .await;
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "id": id,
             "status": "updated",
-            "provider": candidate,
+            "provider": serialize_provider_record(&ProviderRecord {
+                id: candidate.id,
+                name: candidate.name,
+                base_url: candidate.base_url,
+                auth_mode: candidate.auth_mode,
+                default_wire_api: candidate.default_wire_api,
+                state_scope: candidate.state_scope,
+                config_json,
+            }),
         })),
     )
         .into_response()
@@ -459,6 +579,8 @@ async fn get_route(state: State<Arc<ServerState>>, Path(id): Path<String>) -> im
 
 async fn update_route(
     state: State<Arc<ServerState>>,
+    Extension(request_id): Extension<RequestIdExt>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -508,6 +630,7 @@ async fn update_route(
     };
 
     let mut candidate = route_record_to_config(&existing, &existing_targets);
+    let existing_route_json = serialize_route_record(&existing, &existing_targets);
     let replace_targets = patch.targets.is_some();
     if let Some(new_id) = patch.id {
         if new_id != id {
@@ -565,7 +688,7 @@ async fn update_route(
     }
 
     if replace_targets {
-        for target in existing_targets {
+        for target in &existing_targets {
             if let Err(error) = delete_target_row(&state.db, &target.id).await {
                 return error_response_to_response(
                     Error::new(
@@ -595,6 +718,42 @@ async fn update_route(
             }
         }
     }
+
+    let updated_targets = if replace_targets {
+        match get_targets_row(&state.db, &id).await {
+            Ok(targets) => targets,
+            Err(error) => {
+                return error_response_to_response(
+                    Error::new(
+                        ErrorKind::InternalError,
+                        format!("Failed to read updated route targets for audit: {error}"),
+                    )
+                    .to_response(),
+                );
+            }
+        }
+    } else {
+        existing_targets.clone()
+    };
+    let updated_route_json = serialize_route_record(
+        &RouteRecord {
+            id: id.clone(),
+            downstream_model: candidate.downstream_model.clone(),
+            description: candidate.description.clone(),
+            enabled: if candidate.enabled { 1 } else { 0 },
+        },
+        &updated_targets,
+    );
+    write_admin_audit_event(
+        state.as_ref(),
+        request_id.get_id(),
+        &admin_actor_hash(state.as_ref(), &headers),
+        "route_update",
+        "route",
+        &id,
+        &to_redacted_diff_json(existing_route_json, updated_route_json),
+    )
+    .await;
 
     (
         StatusCode::OK,
@@ -992,35 +1151,13 @@ async fn refresh_probes(
 
 // Config endpoints
 async fn export_config(state: State<Arc<ServerState>>) -> Json<serde_json::Value> {
-    // Redact secrets in config export
-    let config = &state.config;
-    Json(serde_json::json!({
-        "server": config.server,
-        "security": {
-            "admin_auth": config.security.admin_auth,
-            "downstream_auth": config.security.downstream_auth,
-            "allow_passthrough_keys": config.security.allow_passthrough_keys,
-            "log_prompts": config.security.log_prompts,
-            "log_tool_outputs": config.security.log_tool_outputs,
-            // api_key is omitted
-        },
-        "providers": config.providers.iter().map(|p| {
-            serde_json::json!({
-                "id": p.id,
-                "name": p.name,
-                "base_url": p.base_url,
-                "auth_mode": p.auth_mode,
-                "default_wire_api": p.default_wire_api,
-                "state_scope": p.state_scope,
-                // api_key is omitted
-            })
-        }).collect::<Vec<_>>(),
-        "routes": config.routes,
-    }))
+    Json(state.config.to_redacted_json())
 }
 
 async fn import_config(
     state: State<Arc<ServerState>>,
+    Extension(request_id): Extension<RequestIdExt>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let config = match parse_import_config(&body) {
@@ -1032,7 +1169,15 @@ async fn import_config(
         return error_response_to_response(error.to_response());
     }
 
-    let applied = match replace_admin_config(&state.db, &config).await {
+    let applied = match replace_admin_config_with_options(
+        &state.db,
+        &config,
+        ApplyConfigOptions {
+            include_managed_api_keys: false,
+        },
+    )
+    .await
+    {
         Ok(applied) => applied,
         Err(error) => {
             return error_response_to_response(
@@ -1044,6 +1189,17 @@ async fn import_config(
             )
         }
     };
+
+    write_admin_audit_event(
+        state.as_ref(),
+        request_id.get_id(),
+        &admin_actor_hash(state.as_ref(), &headers),
+        "config_import",
+        "config",
+        "runtime",
+        &to_redacted_diff_json(serde_json::Value::Null, body.clone()),
+    )
+    .await;
 
     (
         StatusCode::OK,
@@ -1185,6 +1341,12 @@ fn serialize_route_record(route: &RouteRecord, targets: &[TargetRecord]) -> serd
 }
 
 fn serialize_provider_record(provider: &ProviderRecord) -> serde_json::Value {
+    let parsed = serde_json::from_str::<serde_json::Value>(&provider.config_json).ok();
+    let api_key_set = parsed
+        .as_ref()
+        .and_then(|value| value.get("api_key_set"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     serde_json::json!({
         "id": provider.id,
         "name": provider.name,
@@ -1192,6 +1354,7 @@ fn serialize_provider_record(provider: &ProviderRecord) -> serde_json::Value {
         "auth_mode": provider.auth_mode,
         "default_wire_api": provider.default_wire_api,
         "state_scope": provider.state_scope,
+        "api_key_set": api_key_set,
     })
 }
 
@@ -1211,6 +1374,8 @@ fn provider_record_to_config(provider: &ProviderRecord) -> modelwire_core::Provi
         .as_ref()
         .and_then(|value| value.get("config_json"))
         .cloned();
+    // Never surface stored managed key ciphertext via ProviderConfig projection.
+    let api_key = None;
 
     modelwire_core::ProviderConfig {
         id: provider.id.clone(),
@@ -1219,7 +1384,7 @@ fn provider_record_to_config(provider: &ProviderRecord) -> modelwire_core::Provi
         auth_mode: provider.auth_mode.clone(),
         default_wire_api: provider.default_wire_api.clone(),
         state_scope: provider.state_scope.clone(),
-        api_key: None,
+        api_key,
         allow_private_ips,
         skip_ssrf_validation,
         config_json,
@@ -1337,6 +1502,80 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
                 || message.contains("already exists")
         }
         _ => false,
+    }
+}
+
+fn admin_actor_hash(state: &ServerState, headers: &HeaderMap) -> String {
+    let token = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or("admin");
+    let secret = state
+        .config
+        .security
+        .log_secret
+        .as_deref()
+        .unwrap_or("modelwire-admin-audit-default-secret");
+    format!("admin:{}", hash_key_for_logging(token, secret))
+}
+
+fn to_redacted_diff_json(before: serde_json::Value, after: serde_json::Value) -> String {
+    serde_json::json!({
+        "before": redact_json(&before),
+        "after": redact_json(&after)
+    })
+    .to_string()
+}
+
+async fn write_admin_audit_event(
+    state: &ServerState,
+    request_id: &str,
+    actor_hash: &str,
+    action: &str,
+    resource_type: &str,
+    resource_id: &str,
+    diff_json: &str,
+) {
+    if let Err(error) = store_admin_audit_event(
+        &state.db,
+        &AdminAuditInsert {
+            id: &format!("audit_{}", uuid::Uuid::new_v4()),
+            request_id,
+            actor_key_hash: actor_hash,
+            action,
+            resource_type,
+            resource_id,
+            diff_json,
+        },
+    )
+    .await
+    {
+        let _ = store_log(
+            &state.db,
+            request_id,
+            Some(actor_hash),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(500),
+            Some("admin_audit_write_failed"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        tracing::warn!(
+            request_id = %request_id,
+            action = %action,
+            resource_type = %resource_type,
+            resource_id = %resource_id,
+            error = %error,
+            "Failed to persist admin audit event"
+        );
     }
 }
 

@@ -4505,88 +4505,66 @@ Framework behavior currently in place:
     `context_guard_rejects_before_upstream`; and re-validated the aligned
     slices with targeted runtime executions.
 
-Next small-model implementation tasks should target these exact seams:
+88. Closed the May 26 release-blocking continuation and streaming ID privacy
+    gaps:
+    same-upstream native Responses continuation now sends the private upstream
+    handle without replaying transcript input; Chat and Anthropic never use
+    upstream `previous_response_id` and always materialize replay; context guard
+    still estimates materialized history even when the native upstream handle is
+    used; cross-provider handle reuse now requires an explicit non-empty shared
+    `state_scope`; and stream persistence stores the real upstream response
+    handle instead of the rewritten downstream `resp_mw_*` ID. Added/strengthened
+    tests `previous_response_same_upstream`,
+    `cross_provider_handle_reuse_requires_explicit_state_scope`,
+    `streaming_downstream_sse_uses_modelwire_owned_ids`, and
+    `materialized_replay_budget_includes_history`.
 
-```text
-Task:
-  Add lazy probe resolution for explicit RouteSnapshot/TargetSnapshot.
+89. Closed the May 26 tool-call ID privacy gap:
+    downstream function-call IDs are ModelWire-owned (`call_mw_*`), upstream
+    tool-call IDs are retained only in operational transcript metadata for
+    same-upstream native Responses tool-result mapping, and Chat replay keeps
+    upstream tool IDs private by replaying with ModelWire-owned IDs. Strengthened
+    `tool_call_roundtrip_responses` and `tool_call_roundtrip_chat` to assert the
+    exact downstream and upstream request shapes.
 
-Files to edit:
-  - modelwire-server/src/relay.rs
-  - modelwire-db/src/repo/probes.rs
+90. Closed the May 26 streaming SSE compatibility gap for upstream protocols
+    that emit only Chat-style deltas:
+    ModelWire now synthesizes missing downstream `response.created`,
+    `response.output_item.added`, `response.output_item.done`, and
+    `response.completed` events around delta-only streams while preserving the
+    no-fallback-after-commit rule. Strengthened
+    `chat_stream_real_completions_sse_without_event_names` to assert the complete
+    Responses SSE event order.
 
-Do not edit:
-  - modelwire-server/src/routes/responses.rs
+91. Closed the May 26 secret-handling and release-pipeline blockers:
+    upstream error bodies are passed through the default redactor before reaching
+    downstream errors or probe logs; file-seeded managed provider keys now fail
+    closed unless `security.managed_key_encryption_secret` is configured, and are
+    encrypted before operational DB persistence when the secret is present; CI
+    now targets the repository's default `master` branch, removes the invalid
+    rustdocs component, avoids unsupported cross-compilation in the default gate,
+    uses a current Rust Docker builder, adds WebUI checks, and includes release
+    workflow support for GitHub Releases and GHCR images. Added
+    `upstream_error_message_redacts_secret_material` and
+    `file_seed_rejects_plaintext_managed_key_without_encryption_secret`.
 
-Behavior:
-  1. Replace the `WireApi::Auto` error in `try_target` with probe lookup.
-  2. Probe key must be provider ID + credential hash + upstream model.
-  3. Probe order must be responses, anthropic, openai_chat.
-
-Tests:
-  1. Probe cache hit does not call upstream.
-  2. 404 for responses advances to anthropic/chat.
-  3. 401 stops probing.
-
-Acceptance:
-  The task is complete only when these commands pass:
-  - cargo fmt --check
-  - cargo test --workspace
-```
-
-```text
-Task:
-  Persist complete response metadata and upstream handles.
-
-Files to edit:
-  - modelwire-server/src/relay.rs
-  - modelwire-db/src/repo/responses.rs
-
-Do not edit:
-  - modelwire-adapters/src/*.rs
-
-Behavior:
-  1. Store route_id, target_id, provider_id, upstream_model, wire_api,
-     upstream_response_id, state_scope, previous_response_id, status, and usage.
-  2. Store visible output items in response_items in order.
-  3. Store upstream response IDs only in operational state, never downstream JSON.
-
-Tests:
-  1. Native Responses upstream ID is absent downstream but present in SQL.
-  2. Response items are persisted in output order.
-
-Acceptance:
-  The task is complete only when these commands pass:
-  - cargo fmt --check
-  - cargo test --workspace
-```
-
-```text
-Task:
-  Add streaming framework using the same route snapshot and target attempt
-  types.
-
-Files to edit:
-  - modelwire-server/src/relay.rs
-  - modelwire-server/src/routes/responses.rs
-  - modelwire-adapters/src/sse.rs
-
-Do not edit:
-  - modelwire-core/src/config.rs
-
-Behavior:
-  1. `stream = true` must call a new streaming relay path.
-  2. Buffer upstream SSE until the first semantic event before downstream
-     commit.
-  3. Do not fallback after the first downstream SSE event.
-
-Tests:
-  1. Upstream failure before commit falls back.
-  2. Upstream failure after commit emits failure and does not fallback.
-  3. UTF-8 split across chunks is parsed correctly.
-
-Acceptance:
-  The task is complete only when these commands pass:
-  - cargo fmt --check
-  - cargo test --workspace
-```
+92. Closed the May 26 continuation, streaming-tool, and release-hygiene follow-up
+    blockers:
+    Responses SSE text deltas now emit the official
+    `response.output_text.delta` event name while still accepting the legacy
+    `response.text.delta` alias upstream; streaming Chat/Anthropic tool calls
+    preserve tool metadata when the upstream sends it; streaming responses that
+    fail after commit persist `failed` state; `previous_response_id` rejects
+    failed/non-continuable state with `409`; materialized replay now walks the
+    persisted response chain and includes request input items as well as
+    assistant outputs/tool results; provider `<think>...</think>` text is
+    stripped from visible assistant output; archive defaults are safe when the
+    `[archive]` table is omitted; and deployment docs/verification checklists
+    were aligned with CI. Added/strengthened
+    `test_config_archive_defaults_when_table_omitted`,
+    `previous_response_cross_upstream_replay`,
+    `anthropic_streaming_tool_input_maps_to_argument_deltas`,
+    `streaming_failure_after_commit_emits_failure_without_fallback`,
+    `failed_previous_response_id_returns_state_not_continuable`,
+    `provider_thinking_tags_are_stripped_from_visible_text`, and
+    `provider_thinking_tags_not_exposed_as_assistant_text`.

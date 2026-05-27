@@ -83,7 +83,7 @@ pub struct ServerConfig {
 }
 
 /// Archive configuration for conversation recording.
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ArchiveConfig {
     /// Capture mode: off, metadata_only, visible_only, full_visible, debug_raw.
     #[serde(default = "default_archive_capture_mode")]
@@ -96,6 +96,16 @@ pub struct ArchiveConfig {
     /// Whether to include upstream lineage in archives.
     #[serde(default = "default_true")]
     pub include_lineage: bool,
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        Self {
+            capture_mode: default_archive_capture_mode(),
+            root: default_archive_root(),
+            include_lineage: default_true(),
+        }
+    }
 }
 
 fn default_archive_capture_mode() -> String {
@@ -177,6 +187,12 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub log_secret: Option<String>,
 
+    /// Master secret used to encrypt managed upstream provider keys at rest.
+    ///
+    /// This must be set for production deployments that use `auth_mode = "managed"`.
+    #[serde(default)]
+    pub managed_key_encryption_secret: Option<String>,
+
     /// Whether this is a public deployment (enables additional checks).
     #[serde(default)]
     pub public_deployment: bool,
@@ -184,6 +200,13 @@ pub struct SecurityConfig {
     /// Optional per-IP request rate limit (requests per minute) for public API.
     #[serde(default)]
     pub ip_requests_per_minute: Option<u32>,
+
+    /// Whether to trust client-supplied forwarding IP headers for rate limiting.
+    ///
+    /// When false (default), ModelWire does not trust `x-forwarded-for`/`x-real-ip`
+    /// and falls back to an anonymous identity unless a trusted gateway mode is used.
+    #[serde(default)]
+    pub trust_forwarded_ip_headers: bool,
 
     /// Scoped relay keys for downstream auth/authorization.
     ///
@@ -394,6 +417,13 @@ impl Config {
         Ok(config)
     }
 
+    /// Convert config to JSON and remove secret-bearing fields for safe export/logging.
+    pub fn to_redacted_json(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
+        redact_config_value(&mut value);
+        value
+    }
+
     /// Validate the configuration.
     fn validate(&self) -> Result<(), ConfigError> {
         // Check for duplicate provider IDs
@@ -445,6 +475,47 @@ impl Config {
         targets.sort_by_key(|t| t.priority);
         targets
     }
+}
+
+fn redact_config_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for key in keys {
+                if is_secret_config_key(&key) {
+                    map.remove(&key);
+                    continue;
+                }
+                if let Some(child) = map.get_mut(&key) {
+                    redact_config_value(child);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_config_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_secret_config_key(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "api_key"
+            | "admin_password"
+            | "log_secret"
+            | "trusted_passthrough_value"
+            | "authorization"
+            | "x_api_key"
+            | "x-api-key"
+            | "bearer_token"
+            | "private_key"
+    ) || normalized.ends_with("_secret")
+        || normalized.ends_with("_password")
+        || normalized.ends_with("_private_key")
 }
 
 /// Configuration error types.
@@ -502,6 +573,14 @@ priority = 10
         assert_eq!(config.server.bind, "127.0.0.1:8787");
         assert_eq!(config.providers.len(), 1);
         assert_eq!(config.routes.len(), 1);
+    }
+
+    #[test]
+    fn test_config_archive_defaults_when_table_omitted() {
+        let config = Config::from_toml("").expect("empty config should use defaults");
+        assert_eq!(config.archive.capture_mode, "off");
+        assert_eq!(config.archive.root, "./archives");
+        assert!(config.archive.include_lineage);
     }
 
     #[test]
@@ -682,6 +761,62 @@ trusted_passthrough_value = "gw-123"
             Some("gw-123")
         );
     }
+
+    #[test]
+    fn redacted_config_omits_secret_fields() {
+        let config = Config {
+            server: ServerConfig::default(),
+            security: SecurityConfig {
+                admin_auth: "local_password".to_string(),
+                admin_password: Some("admin-secret".to_string()),
+                downstream_auth: "relay_key".to_string(),
+                allow_passthrough_keys: false,
+                log_prompts: false,
+                log_tool_outputs: false,
+                log_secret: Some("log-secret".to_string()),
+                managed_key_encryption_secret: Some("enc-secret".to_string()),
+                public_deployment: true,
+                ip_requests_per_minute: Some(120),
+                trust_forwarded_ip_headers: false,
+                relay_keys: vec![RelayKeyConfig {
+                    key_hash: "hash123".to_string(),
+                    enabled: true,
+                    ..RelayKeyConfig::default()
+                }],
+                trusted_passthrough_header: Some("x-gateway-token".to_string()),
+                trusted_passthrough_value: Some("tp-secret".to_string()),
+            },
+            archive: ArchiveConfig::default(),
+            providers: vec![ProviderConfig {
+                id: "provider-a".to_string(),
+                name: "Provider A".to_string(),
+                base_url: "https://api.example.com/v1".to_string(),
+                auth_mode: "managed".to_string(),
+                default_wire_api: "responses".to_string(),
+                state_scope: None,
+                api_key: Some("sk-secret".to_string()),
+                allow_private_ips: false,
+                skip_ssrf_validation: false,
+                config_json: Some(serde_json::json!({
+                    "nested_secret": "value",
+                    "regular": "ok"
+                })),
+            }],
+            routes: vec![],
+        };
+
+        let redacted = config.to_redacted_json();
+        let serialized = redacted.to_string();
+
+        assert!(!serialized.contains("admin-secret"));
+        assert!(!serialized.contains("log-secret"));
+        assert!(!serialized.contains("enc-secret"));
+        assert!(!serialized.contains("tp-secret"));
+        assert!(!serialized.contains("sk-secret"));
+        assert!(!serialized.contains("value"));
+        assert!(serialized.contains("\"regular\":\"ok\""));
+        assert!(serialized.contains("hash123"));
+    }
 }
 
 // Provide Default implementations (used in tests and integration)
@@ -714,8 +849,10 @@ impl Default for SecurityConfig {
             log_prompts: false,
             log_tool_outputs: false,
             log_secret: None,
+            managed_key_encryption_secret: None,
             public_deployment: false,
             ip_requests_per_minute: None,
+            trust_forwarded_ip_headers: false,
             relay_keys: vec![],
             trusted_passthrough_header: None,
             trusted_passthrough_value: None,

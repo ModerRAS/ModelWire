@@ -9,17 +9,18 @@
 # Server configuration
 # -----------------------------------------------------------------------------
 [server]
-# Bind address (default: 127.0.0.1:8787)
-# For Docker: bind to 0.0.0.0:8787 or use environment variable
-bind = "0.0.0.0:8787"
+# Bind address (default: 127.0.0.1:8787).
+# Public/Docker deployments should also configure relay keys before binding
+# to 0.0.0.0:8787.
+bind = "127.0.0.1:8787"
 
 # Database URL (default: sqlite://modelwire.db)
 # For Docker with volume mount: sqlite:///app/data/modelwire.db
-database_url = "sqlite:///app/data/modelwire.db"
+database_url = "sqlite://modelwire.db"
 
 # Data directory for SQLite and archives
 # For Docker: /app/data (mounted from volume)
-data_dir = "/app/data"
+data_dir = "."
 
 # Timeouts (defaults are reasonable for most deployments)
 # upstream_timeout_secs = 120
@@ -37,6 +38,12 @@ data_dir = "/app/data"
 # Downstream authentication mode: "relay_key", "passthrough", or "none"
 # For public deployments, use "relay_key" with strong keys
 # downstream_auth = "relay_key"
+#
+# IMPORTANT: relay_key mode now requires at least one enabled relay key entry.
+# Example:
+# [[security.relay_keys]]
+# key_hash = "replace-with-hashed-key-prefix"
+# enabled = true
 
 # Set to true only if behind a secure network
 # allow_passthrough_keys = false
@@ -84,7 +91,7 @@ data_dir = "/app/data"
 # description = "GPT-4o via OpenAI"
 # enabled = true
 # [[routes.targets]]
-# provider_id = "openai"
+# provider = "openai"
 # upstream_model = "gpt-4o"
 # priority = 1
 # enabled = true
@@ -96,5 +103,5 @@ data_dir = "/app/data"
 # Capture mode: "off", "metadata_only", "visible_only", "full_visible", "debug_raw"
 # capture_mode = "off"
 
-# Archive directory (relative to data_dir)
-# directory = "archives"
+# Archive root directory
+# root = "./archives"

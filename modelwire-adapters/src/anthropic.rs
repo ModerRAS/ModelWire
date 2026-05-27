@@ -91,6 +91,23 @@ impl UpstreamAdapter for AnthropicAdapter {
                         }],
                     }));
                 }
+                modelwire_core::CanonicalInputItem::AssistantFunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                } => {
+                    let parsed_arguments = serde_json::from_str::<serde_json::Value>(arguments)
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    messages.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": call_id,
+                            "name": name,
+                            "input": parsed_arguments,
+                        }],
+                    }));
+                }
             }
         }
 
@@ -130,7 +147,16 @@ impl UpstreamAdapter for AnthropicAdapter {
             body["temperature"] = serde_json::json!(temp);
         }
 
-        debug!(body = %serde_json::to_string_pretty(&body).unwrap_or_default(), "Built Anthropic request");
+        debug!(
+            stream = canonical.stream,
+            messages = body
+                .get("messages")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| items.len())
+                .unwrap_or(0),
+            has_tools = !canonical.tools.is_empty(),
+            "Built Anthropic request"
+        );
 
         UpstreamRequest {
             method: "POST".to_string(),
@@ -293,15 +319,31 @@ impl UpstreamAdapter for AnthropicAdapter {
                     UpstreamError::InvalidResponse("missing content_block".to_string())
                 })?;
                 let block_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let index = json.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
 
                 if block_type == "text" {
-                    let item_id = modelwire_core::generate_message_id();
                     Ok(Some(CanonicalEvent::OutputItemAdded {
                         response_id: "".to_string(),
                         item: modelwire_core::CanonicalOutputItem::Message {
-                            id: item_id,
+                            id: index.to_string(),
                             role: "assistant".to_string(),
                             content: vec![],
+                        },
+                    }))
+                } else if block_type == "tool_use" {
+                    let call_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let input = item
+                        .get("input")
+                        .map(|v| serde_json::to_string(v).unwrap_or_default())
+                        .unwrap_or_default();
+                    Ok(Some(CanonicalEvent::OutputItemAdded {
+                        response_id: "".to_string(),
+                        item: modelwire_core::CanonicalOutputItem::FunctionCall {
+                            id: index.to_string(),
+                            call_id: call_id.to_string(),
+                            name: name.to_string(),
+                            arguments: input,
                         },
                     }))
                 } else {

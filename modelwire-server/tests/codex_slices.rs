@@ -9,7 +9,8 @@
 
 use axum::{body::Body, http::Request};
 use modelwire_core::{
-    ArchiveConfig, Config, ProviderConfig, RouteConfig, SecurityConfig, ServerConfig, TargetConfig,
+    hash_key_for_logging, ArchiveConfig, Config, ProviderConfig, RelayKeyConfig, RouteConfig,
+    SecurityConfig, ServerConfig, TargetConfig,
 };
 use modelwire_db::Database;
 use modelwire_server::{server::build_router, ServerState};
@@ -281,9 +282,9 @@ mod codex_simple_text_stream_tests {
                  data: {\"response\":{\"id\":\"resp_upstream_stream\",\"model\":\"gpt-upstream\",\"created_at\":1234567890}}\n\n\
                  event: response.output_item.added\n\
                  data: {\"response_id\":\"resp_upstream_stream\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}\n\n\
-                 event: response.text.delta\n\
+                 event: response.output_text.delta\n\
                  data: {\"item_id\":\"msg_1\",\"delta\":{\"text\":\"Hello\"}}\n\n\
-                 event: response.text.delta\n\
+                 event: response.output_text.delta\n\
                  data: {\"item_id\":\"msg_1\",\"delta\":{\"text\":\" there!\"}}\n\n\
                  event: response.output_item.done\n\
                  data: {\"response_id\":\"resp_upstream_stream\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello there!\"}]}}\n\n\
@@ -345,7 +346,7 @@ mod codex_simple_text_stream_tests {
             "SSE should contain response.created event"
         );
         assert!(
-            body_str.contains("event: response.text.delta"),
+            body_str.contains("event: response.output_text.delta"),
             "SSE should contain text delta events"
         );
         assert!(
@@ -708,12 +709,23 @@ mod codex_tool_loop_shell_like_tests {
 
 /// Build a test ServerState for slice tests.
 async fn build_test_state(upstream_base_url: &str) -> ServerState {
+    let relay_secret = "test-relay-secret";
     let config = Config {
         server: ServerConfig {
             upstream_timeout_secs: 5,
             ..ServerConfig::default()
         },
-        security: SecurityConfig::default(),
+        security: SecurityConfig {
+            downstream_auth: "relay_key".to_string(),
+            log_secret: Some(relay_secret.to_string()),
+            managed_key_encryption_secret: Some("test-managed-key-secret".to_string()),
+            relay_keys: vec![RelayKeyConfig {
+                key_hash: hash_key_for_logging("mw_test_key", relay_secret),
+                enabled: true,
+                ..RelayKeyConfig::default()
+            }],
+            ..SecurityConfig::default()
+        },
         archive: ArchiveConfig::default(),
         providers: vec![ProviderConfig {
             id: "test-provider".to_string(),
@@ -759,6 +771,6 @@ async fn build_test_state(upstream_base_url: &str) -> ServerState {
         probe_locks: dashmap::DashMap::new(),
         key_limiter_counters: dashmap::DashMap::new(),
         ip_limiter_counters: dashmap::DashMap::new(),
-        archive_writer: tokio::sync::Mutex::new(None),
+        archive_writers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     }
 }
