@@ -275,13 +275,11 @@ fn validate_startup_security(
             );
         }
         match auth_mode {
-            "relay_key" => {
-                if !relay_key_entries_enabled {
-                    return Err(
-                        "Public bind/deployment with relay_key auth requires at least one enabled security.relay_keys entry."
-                            .into(),
-                    );
-                }
+            "relay_key" if !relay_key_entries_enabled => {
+                return Err(
+                    "Public bind/deployment with relay_key auth requires at least one enabled security.relay_keys entry."
+                        .into(),
+                );
             }
             "managed" => {
                 return Err(
@@ -289,13 +287,11 @@ fn validate_startup_security(
                         .into(),
                 );
             }
-            "passthrough" | "trusted_passthrough" => {
-                if !security.allow_passthrough_keys {
-                    return Err(
-                        "Public bind/deployment rejects passthrough auth unless allow_passthrough_keys=true."
-                            .into(),
-                    );
-                }
+            "passthrough" | "trusted_passthrough" if !security.allow_passthrough_keys => {
+                return Err(
+                    "Public bind/deployment rejects passthrough auth unless allow_passthrough_keys=true."
+                        .into(),
+                );
             }
             _ => {}
         }

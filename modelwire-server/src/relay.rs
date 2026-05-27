@@ -2858,40 +2858,40 @@ fn synthesize_stream_item_added_if_needed(
                 added_item_ids.insert(item_id.to_string());
             }
         }
-        CanonicalEvent::OutputTextDelta { item_id, .. } => {
-            if added_item_ids.insert(item_id.clone()) {
-                let added = CanonicalEvent::OutputItemAdded {
-                    response_id: response_id.to_string(),
-                    item: CanonicalOutputItem::Message {
-                        id: item_id.clone(),
-                        role: "assistant".to_string(),
-                        content: Vec::new(),
-                    },
-                };
-                let (event_type, payload) = canonical_to_sse(&added);
-                sse_writer.write_event(event_type, &payload);
-                collected_events.push(added);
-            }
+        CanonicalEvent::OutputTextDelta { item_id, .. }
+            if added_item_ids.insert(item_id.clone()) =>
+        {
+            let added = CanonicalEvent::OutputItemAdded {
+                response_id: response_id.to_string(),
+                item: CanonicalOutputItem::Message {
+                    id: item_id.clone(),
+                    role: "assistant".to_string(),
+                    content: Vec::new(),
+                },
+            };
+            let (event_type, payload) = canonical_to_sse(&added);
+            sse_writer.write_event(event_type, &payload);
+            collected_events.push(added);
         }
-        CanonicalEvent::FunctionCallArgumentsDelta { item_id, .. } => {
-            if added_item_ids.insert(item_id.clone()) {
-                let call_id = synthesized_tool_call_ids
-                    .entry(item_id.clone())
-                    .or_insert_with(modelwire_core::generate_call_id)
-                    .clone();
-                let added = CanonicalEvent::OutputItemAdded {
-                    response_id: response_id.to_string(),
-                    item: CanonicalOutputItem::FunctionCall {
-                        id: item_id.clone(),
-                        call_id,
-                        name: "unknown_tool".to_string(),
-                        arguments: String::new(),
-                    },
-                };
-                let (event_type, payload) = canonical_to_sse(&added);
-                sse_writer.write_event(event_type, &payload);
-                collected_events.push(added);
-            }
+        CanonicalEvent::FunctionCallArgumentsDelta { item_id, .. }
+            if added_item_ids.insert(item_id.clone()) =>
+        {
+            let call_id = synthesized_tool_call_ids
+                .entry(item_id.clone())
+                .or_insert_with(modelwire_core::generate_call_id)
+                .clone();
+            let added = CanonicalEvent::OutputItemAdded {
+                response_id: response_id.to_string(),
+                item: CanonicalOutputItem::FunctionCall {
+                    id: item_id.clone(),
+                    call_id,
+                    name: "unknown_tool".to_string(),
+                    arguments: String::new(),
+                },
+            };
+            let (event_type, payload) = canonical_to_sse(&added);
+            sse_writer.write_event(event_type, &payload);
+            collected_events.push(added);
         }
         _ => {}
     }
